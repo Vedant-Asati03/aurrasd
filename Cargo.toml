@@ -1,0 +1,11 @@
+[package]
+name = "aurrasd"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+anyhow = "1.0.102"
+cpal = "0.17.3"
+crossbeam-channel = "0.5.15"
+reqwest = { version = "0.13.2", features = ["blocking"] }
+symphonia = { version = "0.5.5", features = ["all"] }
