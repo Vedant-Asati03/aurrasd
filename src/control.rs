@@ -1,71 +1,79 @@
-use std::{
-    sync::{
-        Arc,
-        atomic::{AtomicBool, Ordering},
-    },
-    thread,
-};
+use std::thread;
 
 use anyhow::Result;
+use cpal::traits::StreamTrait;
 use crossbeam_channel::Receiver;
 
 use crate::{
-    audio::{decode::decode_thread, ring::RingBuffer, types::AudioFormat},
+    audio::{decode::decode_thread, types::AudioFormat},
     command::Command,
 };
 
-pub fn run_control_loop(
-    cmd_rx: Receiver<Command>,
-    ring: Arc<RingBuffer>,
-    fmt_tx: crossbeam_channel::Sender<AudioFormat>,
-) -> Result<()> {
-    let mut current_decode: Option<thread::JoinHandle<()>> = None;
-    let mut stop_flag: Option<Arc<AtomicBool>> = None;
+fn is_url_path(path_str: &str) -> bool {
+    path_str.starts_with("http://") || path_str.starts_with("https://")
+}
+
+pub fn run_control_loop(cmd_rx: Receiver<Command>) -> Result<()> {
+    let mut current_decode_thread: Option<thread::JoinHandle<()>> = None;
+    let mut current_stream: Option<cpal::Stream> = None;
 
     loop {
-        match cmd_rx.recv()? {
-            Command::Play(path) => {
-                if let Some(flag) = stop_flag.take() {
-                    flag.store(true, Ordering::Relaxed);
+        let command = match cmd_rx.recv() {
+            Ok(cmd) => cmd,
+            Err(err) => {
+                if let Some(handle) = current_decode_thread.take() {
+                    let _ = handle.join();
                 }
+                return Err(err.into());
+            }
+        };
 
-                if let Some(handle) = current_decode.take() {
+        match command {
+            Command::Play(path) => {
+                current_stream = None;
+                if let Some(handle) = current_decode_thread.take() {
                     let _ = handle.join();
                 }
 
-                let ring_clone = ring.clone();
-                let fmt_tx = fmt_tx.clone();
+                let (data_tx, data_rx) = crossbeam_channel::bounded::<f32>(240000);
+                let (fmt_tx, fmt_rx) = crossbeam_channel::bounded::<AudioFormat>(1);
 
                 let path_str = path.to_string_lossy().to_string();
-                let is_url = path_str.starts_with("http://") || path_str.starts_with("https://");
+                let is_url = is_url_path(&path_str);
 
-                let stop = Arc::new(AtomicBool::new(false));
-                let stop_clone = stop.clone();
+                current_decode_thread = Some(thread::spawn(move || {
+                    if let Err(err) = decode_thread(&path_str, is_url, data_tx, fmt_tx) {
+                        eprintln!("Decode thread error: {err:#}");
+                    }
+                }));
 
-                let handle = thread::spawn(move || {
-                    let _ = decode_thread(&path_str, is_url, ring_clone, fmt_tx, stop_clone);
-                });
-
-                current_decode = Some(handle);
-                stop_flag = Some(stop);
+                if let Ok(format) = fmt_rx.recv() {
+                    match crate::audio::output::play_audio(data_rx, &format) {
+                        Ok(stream) => current_stream = Some(stream),
+                        Err(e) => eprintln!("Failed to play audio: {}", e),
+                    }
+                }
             }
 
             Command::Stop => {
-                if let Some(flag) = stop_flag.take() {
-                    flag.store(true, Ordering::Relaxed);
-                }
-
-                if let Some(handle) = current_decode.take() {
+                current_stream = None;
+                if let Some(handle) = current_decode_thread.take() {
                     let _ = handle.join();
                 }
             }
 
             Command::Pause => {
-                // later aligator
+                if let Some(stream) = &current_stream {
+                    let _ = stream.pause();
+                    println!("Song paused");
+                }
             }
 
             Command::Resume => {
-                // ...
+                if let Some(stream) = &current_stream {
+                    let _ = stream.play();
+                    println!("Song resumed");
+                }
             }
 
             Command::SetVolume(_) => {
