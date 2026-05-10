@@ -1,109 +1,55 @@
-use std::{fs::File, path::Path};
+use crate::audio::constants::{FFT_CHUNK_SIZE, INTERNAL_CHANNELS, INTERNAL_SAMPLE_RATE};
 
-use crossbeam_channel::Sender;
+use std::{collections::VecDeque, fs::File, path::Path, thread, time::Duration};
+
+use audioadapter_buffers::direct::InterleavedSlice;
 use reqwest::header::CONTENT_TYPE;
-
-use symphonia::core::io::{MediaSource, ReadOnlySource};
-use symphonia::core::{
-    audio::SampleBuffer, codecs::DecoderOptions, formats::FormatOptions, io::MediaSourceStream,
-    meta::MetadataOptions, probe::Hint,
+use ringbuf::traits::Producer;
+use rubato::{Fft, FixedSync, Indexing, Resampler};
+use symphonia::{
+    core::{
+        audio::SampleBuffer,
+        codecs::DecoderOptions,
+        formats::FormatOptions,
+        io::{MediaSource, MediaSourceStream, ReadOnlySource},
+        meta::MetadataOptions,
+        probe::Hint,
+    },
+    default::{get_codecs, get_probe},
 };
-use symphonia::default::{get_codecs, get_probe};
-
-use crate::audio::types::AudioFormat;
 
 #[derive(thiserror::Error, Debug)]
 pub enum DecodeError {
-    #[error("failed to initialize HTTP client: {source}")]
-    HttpClient {
-        #[source]
-        source: reqwest::Error,
-    },
+    #[error("failed to fetch URL")]
+    Http,
 
-    #[error("failed to fetch URL `{url}`: {source}")]
-    HttpRequest {
-        url: String,
-        #[source]
-        source: reqwest::Error,
-    },
+    #[error("failed to open file")]
+    File,
 
-    #[error("URL `{url}` returned non-success HTTP status: {status}")]
-    HttpStatus {
-        url: String,
-        status: reqwest::StatusCode,
-    },
-
-    #[error("failed to open file `{path}`: {source}")]
-    OpenFile {
-        path: String,
-        #[source]
-        source: std::io::Error,
-    },
-
-    #[error("failed to detect media format for `{target}`: {source}")]
-    Probe {
-        target: String,
-        #[source]
-        source: symphonia::core::errors::Error,
-    },
+    #[error("failed to probe format")]
+    Probe,
 
     #[error("no audio track")]
     NoTrack,
 
-    #[error("failed to initialize audio decoder: {source}")]
-    DecoderInit {
-        #[source]
-        source: symphonia::core::errors::Error,
-    },
+    #[error("failed to initialize decoder")]
+    Decoder,
 
-    #[error("decode failed: {source}")]
-    Decode {
-        #[source]
-        source: symphonia::core::errors::Error,
-    },
+    #[error("decode failed")]
+    Decode,
 }
 
 type DecodeResult<T> = std::result::Result<T, DecodeError>;
 
-enum SupportedMimeType {
-    Mp4,
-    Mpeg,
-    Webm,
-    Ogg,
-    Flac,
-    Wav,
-    Aac,
-}
-
-impl SupportedMimeType {
-    fn from_str(s: &str) -> Option<Self> {
-        use SupportedMimeType::*;
-
-        match s {
-            "audio/mp4" | "video/mp4" => Some(Mp4),
-            "audio/mpeg" => Some(Mpeg),
-            "audio/webm" | "video/webm" => Some(Webm),
-            "audio/ogg" | "application/ogg" => Some(Ogg),
-            "audio/flac" => Some(Flac),
-            "audio/wav" | "audio/x-wav" => Some(Wav),
-            "audio/aac" => Some(Aac),
-            _ => None,
-        }
-    }
-}
-
 fn extension_from_mime(mime: &str) -> Option<&'static str> {
-    let mime_str = mime.split(';').next().unwrap_or_default().trim();
-
-    match SupportedMimeType::from_str(mime_str) {
-        Some(SupportedMimeType::Mp4) => Some("mp4"),
-        Some(SupportedMimeType::Mpeg) => Some("mp3"),
-        Some(SupportedMimeType::Webm) => Some("webm"),
-        Some(SupportedMimeType::Ogg) => Some("ogg"),
-        Some(SupportedMimeType::Flac) => Some("flac"),
-        Some(SupportedMimeType::Wav) => Some("wav"),
-        Some(SupportedMimeType::Aac) => Some("aac"),
-        None => None,
+    match mime.split(';').next()?.trim() {
+        "audio/mp4" | "video/mp4" => Some("mp4"),
+        "audio/mpeg" => Some("mp3"),
+        "audio/webm" | "video/webm" => Some("webm"),
+        "audio/ogg" => Some("ogg"),
+        "audio/flac" => Some("flac"),
+        "audio/wav" => Some("wav"),
+        _ => None,
     }
 }
 
@@ -117,84 +63,51 @@ fn build_probe_hint(path: &str, is_url: bool, content_type: Option<&str>) -> Hin
 
     if is_url {
         if let Ok(url) = reqwest::Url::parse(path) {
-            if let Some((_, mime)) = url.query_pairs().find(|(key, _)| key == "mime")
-                && let Some(ext) = extension_from_mime(mime.as_ref())
-            {
-                hint.with_extension(ext);
-                return hint;
-            }
-
             if let Some(seg) = url
                 .path_segments()
-                .and_then(|mut segments| segments.next_back())
-                .and_then(|name| Path::new(name).extension())
-                .and_then(|ext| ext.to_str())
+                .and_then(|mut s| s.next_back())
+                .and_then(|n| Path::new(n).extension())
+                .and_then(|e| e.to_str())
             {
                 hint.with_extension(seg);
             }
         }
-    } else if let Some(ext) = Path::new(path).extension().and_then(|ext| ext.to_str()) {
+    } else if let Some(ext) = Path::new(path).extension().and_then(|e| e.to_str()) {
         hint.with_extension(ext);
     }
 
     hint
 }
 
-fn open_media(path: &str, is_url: bool) -> DecodeResult<(Box<dyn MediaSource>, Hint)> {
-    if is_url {
-        let client = reqwest::blocking::Client::builder()
-            .user_agent("aurrasd/0.1")
-            .build()
-            .map_err(|source| DecodeError::HttpClient { source })?;
+fn open_media(path: &str) -> DecodeResult<(Box<dyn MediaSource>, Hint)> {
+    let is_url = path.starts_with("http://") || path.starts_with("https://");
 
-        let resp = client
+    if is_url {
+        let resp = reqwest::blocking::Client::new()
             .get(path)
             .send()
-            .map_err(|source| DecodeError::HttpRequest {
-                url: path.to_owned(),
-                source,
-            })?;
-
-        let status = resp.status();
-        if !status.is_success() {
-            return Err(DecodeError::HttpStatus {
-                url: path.to_owned(),
-                status,
-            });
-        }
+            .map_err(|_| DecodeError::Http)?;
 
         let content_type = resp
             .headers()
             .get(CONTENT_TYPE)
-            .and_then(|v| v.to_str().ok())
-            .map(|v| v.to_string());
-        let hint = build_probe_hint(path, true, content_type.as_deref());
+            .and_then(|v| v.to_str().ok());
+
+        let hint = build_probe_hint(path, true, content_type);
 
         Ok((Box::new(ReadOnlySource::new(resp)), hint))
     } else {
-        let file = File::open(path).map_err(|source| DecodeError::OpenFile {
-            path: path.to_owned(),
-            source,
-        })?;
+        let file = File::open(path).map_err(|_| DecodeError::File)?;
+
         let hint = build_probe_hint(path, false, None);
+
         Ok((Box::new(file), hint))
     }
 }
 
-pub fn decode_thread(
-    path: &str,
-    is_url: bool,
-    data_tx: Sender<f32>,
-    fmt_tx: Sender<AudioFormat>,
-) -> DecodeResult<()> {
-    let (source, hint) = open_media(path, is_url)?;
+pub fn decode_thread(path: &str, mut producer: ringbuf::HeapProd<f32>) -> DecodeResult<()> {
+    let (source, hint) = open_media(path)?;
     let mss = MediaSourceStream::new(source, Default::default());
-
-    let target = if is_url {
-        format!("url: {path}")
-    } else {
-        format!("file: {path}")
-    };
 
     let probed = get_probe()
         .format(
@@ -203,56 +116,202 @@ pub fn decode_thread(
             &FormatOptions::default(),
             &MetadataOptions::default(),
         )
-        .map_err(|source| DecodeError::Probe {
-            target: target.clone(),
-            source,
-        })?;
-
+        .map_err(|_| DecodeError::Probe)?;
     let mut format = probed.format;
+
     let track = format.default_track().ok_or(DecodeError::NoTrack)?;
     let track_id = track.id;
 
     let mut decoder = get_codecs()
         .make(&track.codec_params, &DecoderOptions::default())
-        .map_err(|source| DecodeError::DecoderInit { source })?;
+        .map_err(|_| DecodeError::Decoder)?;
 
-    let mut sent_format: Option<AudioFormat> = None;
+    let mut accumulation = VecDeque::<f32>::new();
 
-    'decode: while let Ok(packet) = format.next_packet() {
+    let mut current_rate = None;
+    let mut resampler = None;
+
+    loop {
+        let packet = match format.next_packet() {
+            Ok(packet) => packet,
+            Err(_) => break,
+        };
+
         if packet.track_id() != track_id {
             continue;
         }
 
         let decoded = match decoder.decode(&packet) {
-            Ok(d) => d,
+            Ok(decoded) => decoded,
             Err(symphonia::core::errors::Error::DecodeError(_)) => continue,
-            Err(source) => return Err(DecodeError::Decode { source }),
+            Err(_) => return Err(DecodeError::Decode),
         };
 
         let spec = *decoded.spec();
 
-        if sent_format.is_none() {
-            let fmt = AudioFormat {
-                sample_rate: spec.rate,
-                channels: spec.channels.count() as u16,
-            };
-
-            let _ = fmt_tx.send(fmt.clone());
-            sent_format = Some(fmt);
-        }
+        let input_rate = spec.rate;
+        let input_channels = spec.channels.count();
 
         let mut buf = SampleBuffer::<f32>::new(decoded.capacity() as u64, spec);
+
         buf.copy_interleaved_ref(decoded);
 
-        for &sample in buf.samples() {
-            loop {
-                match data_tx.try_send(sample) {
-                    Ok(_) => break,
-                    Err(crossbeam_channel::TrySendError::Full(_)) => {
-                        std::thread::sleep(std::time::Duration::from_millis(1));
+        let samples = buf.samples();
+
+        let normalized_samples = if input_channels == 1 {
+            let mut stereo = Vec::with_capacity(samples.len() * 2);
+
+            for &s in samples {
+                stereo.push(s);
+                stereo.push(s);
+            }
+
+            stereo
+        } else {
+            samples.to_vec()
+        };
+
+        if input_rate == INTERNAL_SAMPLE_RATE {
+            for &sample in &normalized_samples {
+                loop {
+                    match producer.try_push(sample) {
+                        Ok(_) => break,
+
+                        Err(_) => {
+                            thread::sleep(Duration::from_micros(100));
+                        }
                     }
-                    Err(crossbeam_channel::TrySendError::Disconnected(_)) => {
-                        break 'decode;
+                }
+            }
+
+            continue;
+        }
+
+        if current_rate != Some(input_rate) {
+            accumulation.clear();
+
+            resampler = Some(
+                Fft::<f32>::new(
+                    input_rate as usize,
+                    INTERNAL_SAMPLE_RATE as usize,
+                    FFT_CHUNK_SIZE,
+                    INTERNAL_CHANNELS as usize,
+                    INTERNAL_CHANNELS as usize,
+                    FixedSync::Input,
+                )
+                .unwrap(),
+            );
+
+            current_rate = Some(input_rate);
+        }
+
+        let resampler = resampler.as_mut().unwrap();
+
+        accumulation.extend(normalized_samples);
+
+        let needed_frames = resampler.input_frames_next();
+
+        let needed_samples = needed_frames * INTERNAL_CHANNELS as usize;
+
+        while accumulation.len() >= needed_samples {
+            let mut chunk = Vec::<f32>::with_capacity(needed_samples);
+
+            for _ in 0..needed_samples {
+                chunk.push(accumulation.pop_front().unwrap());
+            }
+
+            let input_adapter =
+                InterleavedSlice::new(&chunk, INTERNAL_CHANNELS as usize, needed_frames).unwrap();
+
+            let output_frames = resampler.output_frames_max();
+
+            let mut out = vec![0.0f32; output_frames * INTERNAL_CHANNELS as usize];
+
+            let mut output_adapter =
+                InterleavedSlice::new_mut(&mut out, INTERNAL_CHANNELS as usize, output_frames)
+                    .unwrap();
+
+            let indexing = Indexing {
+                input_offset: 0,
+                output_offset: 0,
+                active_channels_mask: None,
+                partial_len: None,
+            };
+
+            let (_, written_frames) = match resampler.process_into_buffer(
+                &input_adapter,
+                &mut output_adapter,
+                Some(&indexing),
+            ) {
+                Ok(v) => v,
+
+                Err(_) => continue,
+            };
+
+            let output_samples = &out[..written_frames * INTERNAL_CHANNELS as usize];
+
+            for &sample in output_samples {
+                loop {
+                    match producer.try_push(sample) {
+                        Ok(_) => break,
+
+                        Err(_) => {
+                            thread::sleep(Duration::from_micros(100));
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    if let Some(resampler) = resampler.as_mut() {
+        let needed_frames = resampler.input_frames_next();
+
+        let needed_samples = needed_frames * INTERNAL_CHANNELS as usize;
+
+        if !accumulation.is_empty() {
+            while accumulation.len() < needed_samples {
+                accumulation.push_back(0.0);
+            }
+
+            let mut chunk = Vec::<f32>::with_capacity(needed_samples);
+
+            for _ in 0..needed_samples {
+                chunk.push(accumulation.pop_front().unwrap());
+            }
+
+            let input_adapter =
+                InterleavedSlice::new(&chunk, INTERNAL_CHANNELS as usize, needed_frames).unwrap();
+
+            let output_frames = resampler.output_frames_max();
+
+            let mut out = vec![0.0f32; output_frames * INTERNAL_CHANNELS as usize];
+
+            let mut output_adapter =
+                InterleavedSlice::new_mut(&mut out, INTERNAL_CHANNELS as usize, output_frames)
+                    .unwrap();
+
+            let indexing = Indexing {
+                input_offset: 0,
+                output_offset: 0,
+                active_channels_mask: None,
+                partial_len: None,
+            };
+
+            if let Ok((_, written_frames)) =
+                resampler.process_into_buffer(&input_adapter, &mut output_adapter, Some(&indexing))
+            {
+                let output_samples = &out[..written_frames * INTERNAL_CHANNELS as usize];
+
+                for &sample in output_samples {
+                    loop {
+                        match producer.try_push(sample) {
+                            Ok(_) => break,
+
+                            Err(_) => {
+                                thread::sleep(Duration::from_micros(100));
+                            }
+                        }
                     }
                 }
             }
