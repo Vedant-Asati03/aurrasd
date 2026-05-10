@@ -8,6 +8,10 @@ pub struct AudioFormat {
 
 impl Display for AudioFormat {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "AudioFormat(channels: {}, sample_rate: {} Hz)", self.channels, self.sample_rate)
+        write!(
+            f,
+            "AudioFormat(channels: {}, sample_rate: {} Hz)",
+            self.channels, self.sample_rate
+        )
     }
 }
