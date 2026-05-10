@@ -1,11 +1,18 @@
+use crate::audio::constants::{
+    INTERNAL_BUFFER_SECONDS, INTERNAL_CHANNELS, INTERNAL_SAMPLE_RATE, PREBUFFER_MS,
+};
+
+use std::{thread, time::Duration};
+
 use anyhow::{Context, Result};
 use cpal::{
-    Device, StreamConfig,
+    Device, SampleFormat, StreamConfig, SupportedStreamConfig,
     traits::{DeviceTrait, HostTrait, StreamTrait},
 };
-use crossbeam_channel::Receiver;
-
-use crate::audio::types::AudioFormat;
+use ringbuf::{
+    HeapRb,
+    traits::{Consumer, Observer, Split},
+};
 
 fn get_output_device() -> Result<Device> {
     cpal::default_host()
@@ -13,28 +20,50 @@ fn get_output_device() -> Result<Device> {
         .context("No output device found")
 }
 
-pub fn play_audio(data_rx: Receiver<f32>, format: &AudioFormat) -> Result<cpal::Stream> {
+fn select_output_config(device: &Device) -> Result<SupportedStreamConfig> {
+    let supported = device.supported_output_configs()?;
+
+    for cfg in supported {
+        if cfg.channels() == INTERNAL_CHANNELS && cfg.sample_format() == SampleFormat::F32 {
+            return Ok(cfg.with_sample_rate(INTERNAL_SAMPLE_RATE));
+        }
+    }
+
+    Err(anyhow::anyhow!("No suitable output config found"))
+}
+
+pub fn create_audio_buffer() -> (ringbuf::HeapProd<f32>, ringbuf::HeapCons<f32>) {
+    let capacity =
+        INTERNAL_SAMPLE_RATE as usize * INTERNAL_CHANNELS as usize * INTERNAL_BUFFER_SECONDS;
+
+    HeapRb::<f32>::new(capacity).split()
+}
+
+pub fn play_audio(mut consumer: ringbuf::HeapCons<f32>) -> Result<cpal::Stream> {
     let device = get_output_device()?;
 
-    let config = StreamConfig {
-        channels: format.channels,
-        sample_rate: format.sample_rate,
-        buffer_size: cpal::BufferSize::Default,
-    };
+    let config = select_output_config(&device)?;
+
+    let prebuffer_samples =
+        (INTERNAL_SAMPLE_RATE as usize * INTERNAL_CHANNELS as usize * PREBUFFER_MS) / 1000;
+
+    while consumer.occupied_len() < prebuffer_samples {
+        thread::sleep(Duration::from_millis(10));
+    }
 
     let stream = device.build_output_stream(
-        &config,
+        &StreamConfig {
+            channels: config.channels(),
+            sample_rate: config.sample_rate(),
+            buffer_size: cpal::BufferSize::Default,
+        },
         move |output: &mut [f32], _| {
             for sample in output.iter_mut() {
-                match data_rx.try_recv() {
-                    Ok(s) => *sample = s,
-                    Err(crossbeam_channel::TryRecvError::Empty) => *sample = 0.0,
-                    Err(crossbeam_channel::TryRecvError::Disconnected) => *sample = 0.0,
-                }
+                *sample = consumer.try_pop().unwrap_or(0.0);
             }
         },
         move |err| {
-            eprintln!("Playback error: {}", err);
+            eprintln!("Playback error: {err}");
         },
         None,
     )?;
