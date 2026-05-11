@@ -1,32 +1,37 @@
 use crate::audio::{
     constants::{INTERNAL_BUFFER_SECONDS, INTERNAL_FORMAT, PREBUFFER_MS},
+    output_adapter::OutputAdapter,
     types::AudioFormat,
 };
 
 use std::{thread, time::Duration};
 
-use anyhow::{Context, Ok, Result};
+use anyhow::{Context, Result, anyhow};
 use cpal::{
     Device, SampleFormat, StreamConfig,
     traits::{DeviceTrait, HostTrait, StreamTrait},
 };
 use ringbuf::{
     HeapRb,
-    traits::{Consumer, Observer, Split},
+    traits::{Observer, Split},
 };
 
-fn get_output_device() -> Result<Device> {
+pub fn get_output_device() -> Result<Device> {
     cpal::default_host()
         .default_output_device()
         .context("No output device found")
 }
 
-fn select_output_format(device: &Device) -> Result<AudioFormat> {
+pub fn select_output_format(device: &Device) -> Result<AudioFormat> {
     let supported = device.supported_output_configs()?;
 
-    // best case - exact match
+    // exact match
     for cfg in supported.clone() {
-        if cfg.sample_format() == SampleFormat::F32 && cfg.channels() == INTERNAL_FORMAT.channels {
+        if (cfg.sample_format() == SampleFormat::F32
+            || cfg.sample_format() == SampleFormat::I16
+            || cfg.sample_format() == SampleFormat::U16)
+            && cfg.channels() == INTERNAL_FORMAT.channels
+        {
             let min = cfg.min_sample_rate();
 
             let max = cfg.max_sample_rate();
@@ -35,32 +40,27 @@ fn select_output_format(device: &Device) -> Result<AudioFormat> {
                 return Ok(AudioFormat::new(
                     cfg.channels(),
                     INTERNAL_FORMAT.sample_rate,
+                    cfg.sample_format(),
                 ));
             }
         }
     }
 
-    // fallback case - stereo f32 nearest supported
-    for cfg in supported.clone() {
-        if cfg.sample_format() == SampleFormat::F32 && cfg.channels() == 2 {
-            return Ok(AudioFormat::new(
-                2,
-                cfg.with_max_sample_rate().sample_rate(),
-            ));
-        }
-    }
-
-    // final fallback
+    // nearest match
     for cfg in supported {
-        if cfg.sample_format() == SampleFormat::F32 {
+        if cfg.sample_format() == SampleFormat::F32
+            || cfg.sample_format() == SampleFormat::I16
+            || cfg.sample_format() == SampleFormat::U16
+        {
             return Ok(AudioFormat::new(
                 cfg.channels(),
                 cfg.with_max_sample_rate().sample_rate(),
+                cfg.sample_format(),
             ));
         }
     }
 
-    Err(anyhow::anyhow!("No compatible output device format"))
+    Err(anyhow!("No compatible output format"))
 }
 
 pub fn create_audio_buffer() -> (ringbuf::HeapProd<f32>, ringbuf::HeapCons<f32>) {
@@ -77,7 +77,7 @@ pub fn play_audio(mut consumer: ringbuf::HeapCons<f32>) -> Result<cpal::Stream> 
 
     let config = StreamConfig {
         channels: device_format.channels,
-        sample_rate: device_format.sample_rate,
+        sample_rate: cpal::SampleRate::from(device_format.sample_rate),
         buffer_size: cpal::BufferSize::Default,
     };
 
@@ -89,20 +89,54 @@ pub fn play_audio(mut consumer: ringbuf::HeapCons<f32>) -> Result<cpal::Stream> 
         thread::sleep(Duration::from_millis(10));
     }
 
-    let stream = device.build_output_stream(
-        &config,
-        move |output: &mut [f32], _| {
-            for sample in output.iter_mut() {
-                *sample = consumer.try_pop().unwrap_or(0.0);
-            }
-        },
-        move |err| {
-            eprintln!("Playback error: {err}");
-        },
-        None,
-    )?;
+    let mut adapter = OutputAdapter::new(device_format.clone());
+
+    let error_callback = move |err| {
+        tracing::error!("Playback error: {err}");
+    };
+
+    let stream = match device_format.sample_format {
+        SampleFormat::F32 => device.build_output_stream(
+            &config,
+            move |output: &mut [f32], _| {
+                adapter.fill_buffer(&mut consumer, output);
+            },
+            error_callback,
+            None,
+        )?,
+        SampleFormat::I16 => {
+            let mut temp_buffer = Vec::new();
+            device.build_output_stream(
+                &config,
+                move |output: &mut [i16], _| {
+                    temp_buffer.resize(output.len(), 0.0_f32);
+                    adapter.fill_buffer(&mut consumer, &mut temp_buffer);
+                    for (i, &f) in temp_buffer.iter().enumerate() {
+                        output[i] = cpal::Sample::from_sample(f);
+                    }
+                },
+                error_callback,
+                None,
+            )?
+        }
+        SampleFormat::U16 => {
+            let mut temp_buffer = Vec::new();
+            device.build_output_stream(
+                &config,
+                move |output: &mut [u16], _| {
+                    temp_buffer.resize(output.len(), 0.0_f32);
+                    adapter.fill_buffer(&mut consumer, &mut temp_buffer);
+                    for (i, &f) in temp_buffer.iter().enumerate() {
+                        output[i] = cpal::Sample::from_sample(f);
+                    }
+                },
+                error_callback,
+                None,
+            )?
+        }
+        _ => return Err(anyhow!("Unsupported sample format")),
+    };
 
     stream.play()?;
-
     Ok(stream)
 }

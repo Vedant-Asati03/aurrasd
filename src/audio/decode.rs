@@ -63,15 +63,14 @@ fn build_probe_hint(path: &str, is_url: bool, content_type: Option<&str>) -> Hin
     }
 
     if is_url {
-        if let Ok(url) = reqwest::Url::parse(path) {
-            if let Some(seg) = url
+        if let Ok(url) = reqwest::Url::parse(path)
+            && let Some(seg) = url
                 .path_segments()
                 .and_then(|mut s| s.next_back())
                 .and_then(|n| Path::new(n).extension())
                 .and_then(|e| e.to_str())
-            {
-                hint.with_extension(seg);
-            }
+        {
+            hint.with_extension(seg);
         }
     } else if let Some(ext) = Path::new(path).extension().and_then(|e| e.to_str()) {
         hint.with_extension(ext);
@@ -99,7 +98,6 @@ fn open_media(path: &str) -> DecodeResult<(Box<dyn MediaSource>, Hint)> {
         Ok((Box::new(ReadOnlySource::new(resp)), hint))
     } else {
         let file = File::open(path).map_err(|_| DecodeError::File)?;
-
         let hint = build_probe_hint(path, false, None);
 
         Ok((Box::new(file), hint))
@@ -137,6 +135,9 @@ pub fn decode_thread(
     let mut current_rate = None;
     let mut resampler = None;
 
+    let mut chunk = Vec::<f32>::new();
+    let mut out = Vec::<f32>::new();
+
     loop {
         if shutdown_rx.try_recv().is_ok() {
             break;
@@ -159,31 +160,61 @@ pub fn decode_thread(
         let mut buf = SampleBuffer::<f32>::new(decoded.capacity() as u64, spec);
         buf.copy_interleaved_ref(decoded);
         let samples = buf.samples();
-        let normalized_samples = if input_channels == 1 {
-            let mut stereo = Vec::with_capacity(samples.len() * 2);
 
+        let normalized_samples = if input_channels == INTERNAL_FORMAT.channels as usize {
+            samples.to_vec()
+        } else if input_channels == 1 && INTERNAL_FORMAT.channels == 2 {
+            let mut stereo = Vec::with_capacity(samples.len() * 2);
             for &s in samples {
                 stereo.push(s);
                 stereo.push(s);
             }
-
             stereo
+        } else if input_channels > INTERNAL_FORMAT.channels as usize
+            && INTERNAL_FORMAT.channels == 2
+        {
+            // Very basic downmix from >2 channels to stereo
+            // Just take the first two channels of each frame
+            let mut stereo = Vec::with_capacity((samples.len() / input_channels) * 2);
+            for frame in samples.chunks_exact(input_channels) {
+                stereo.push(frame[0]);
+                stereo.push(frame[1]);
+            }
+            stereo
+        } else if input_channels > INTERNAL_FORMAT.channels as usize
+            && INTERNAL_FORMAT.channels == 1
+        {
+            // Downmix to mono
+            let mut mono = Vec::with_capacity(samples.len() / input_channels);
+            for frame in samples.chunks_exact(input_channels) {
+                mono.push(frame[0]);
+            }
+            mono
         } else {
-            samples.to_vec()
-        };
-        if input_rate == INTERNAL_FORMAT.sample_rate {
-            for &sample in &normalized_samples {
-                loop {
-                    match producer.try_push(sample) {
-                        Ok(_) => break,
-
-                        Err(_) => {
-                            thread::sleep(Duration::from_micros(100));
-                        }
-                    }
+            // Fallback: pad with zeros or just take what we can
+            let mut padded = Vec::with_capacity(
+                samples.len() / input_channels * INTERNAL_FORMAT.channels as usize,
+            );
+            for frame in samples.chunks_exact(input_channels) {
+                for i in 0..INTERNAL_FORMAT.channels as usize {
+                    padded.push(if i < input_channels { frame[i] } else { 0.0 });
                 }
             }
-
+            padded
+        };
+        if input_rate == INTERNAL_FORMAT.sample_rate {
+            let mut remaining = &normalized_samples[..];
+            while !remaining.is_empty() {
+                if shutdown_rx.try_recv().is_ok() {
+                    let _ = finished_tx.send(());
+                    return Ok(());
+                }
+                let pushed = producer.push_slice(remaining);
+                remaining = &remaining[pushed..];
+                if !remaining.is_empty() {
+                    thread::sleep(Duration::from_micros(100));
+                }
+            }
             continue;
         }
         if current_rate != Some(input_rate) {
@@ -198,36 +229,41 @@ pub fn decode_thread(
                     INTERNAL_FORMAT.channels as usize,
                     FixedSync::Input,
                 )
-                .unwrap(),
+                .map_err(|_| DecodeError::Decoder)?,
             );
 
             current_rate = Some(input_rate);
         }
         let resampler = resampler.as_mut().unwrap();
         accumulation.extend(normalized_samples);
-        let needed_frames = resampler.input_frames_next();
-        let needed_samples = needed_frames * INTERNAL_FORMAT.channels as usize;
-        while accumulation.len() >= needed_samples {
-            let mut chunk = Vec::<f32>::with_capacity(needed_samples);
 
+        loop {
+            let needed_frames = resampler.input_frames_next();
+            let needed_samples = needed_frames * INTERNAL_FORMAT.channels as usize;
+
+            if accumulation.len() < needed_samples {
+                break;
+            }
+
+            chunk.clear();
             for _ in 0..needed_samples {
                 chunk.push(accumulation.pop_front().unwrap());
             }
 
             let input_adapter =
                 InterleavedSlice::new(&chunk, INTERNAL_FORMAT.channels as usize, needed_frames)
-                    .unwrap();
+                    .map_err(|_| DecodeError::Decode)?;
 
             let output_frames = resampler.output_frames_max();
 
-            let mut out = vec![0.0f32; output_frames * INTERNAL_FORMAT.channels as usize];
+            out.resize(output_frames * INTERNAL_FORMAT.channels as usize, 0.0);
 
             let mut output_adapter = InterleavedSlice::new_mut(
                 &mut out,
                 INTERNAL_FORMAT.channels as usize,
                 output_frames,
             )
-            .unwrap();
+            .map_err(|_| DecodeError::Decode)?;
 
             let indexing = Indexing {
                 input_offset: 0,
@@ -243,31 +279,23 @@ pub fn decode_thread(
             ) {
                 Ok(v) => v,
                 Err(err) => {
-                    eprintln!("Resampler process error: {err}");
+                    tracing::error!("Resampler process error: {err}");
                     continue;
                 }
             };
 
             let output_samples = &out[..written_frames * INTERNAL_FORMAT.channels as usize];
 
-            for &sample in output_samples {
+            let mut remaining = output_samples;
+            while !remaining.is_empty() {
                 if shutdown_rx.try_recv().is_ok() {
                     let _ = finished_tx.send(());
                     return Ok(());
                 }
-
-                loop {
-                    match producer.try_push(sample) {
-                        Ok(_) => break,
-                        Err(_) => {
-                            if shutdown_rx.try_recv().is_ok() {
-                                let _ = finished_tx.send(());
-
-                                return Ok(());
-                            }
-                            thread::sleep(Duration::from_micros(100));
-                        }
-                    }
+                let pushed = producer.push_slice(remaining);
+                remaining = &remaining[pushed..];
+                if !remaining.is_empty() {
+                    thread::sleep(Duration::from_micros(100));
                 }
             }
         }
