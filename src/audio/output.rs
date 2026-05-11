@@ -21,15 +21,23 @@ fn get_output_device() -> Result<Device> {
 }
 
 fn select_output_config(device: &Device) -> Result<SupportedStreamConfig> {
-    let supported = device.supported_output_configs()?;
+    let mut fallback: Option<SupportedStreamConfig> = None;
 
-    for cfg in supported {
-        if cfg.channels() == INTERNAL_CHANNELS && cfg.sample_format() == SampleFormat::F32 {
+    for cfg in device.supported_output_configs()? {
+        if cfg.sample_format() == SampleFormat::F32
+            && cfg.channels() == 2
+            && cfg.min_sample_rate() <= INTERNAL_SAMPLE_RATE
+            && cfg.max_sample_rate() >= INTERNAL_SAMPLE_RATE
+        {
             return Ok(cfg.with_sample_rate(INTERNAL_SAMPLE_RATE));
+        }
+
+        if cfg.sample_format() == SampleFormat::F32 && cfg.channels() == 2 {
+            fallback = Some(cfg.with_max_sample_rate());
         }
     }
 
-    Err(anyhow::anyhow!("No suitable output config found"))
+    fallback.ok_or_else(|| anyhow::anyhow!("No compatible output config found"))
 }
 
 pub fn create_audio_buffer() -> (ringbuf::HeapProd<f32>, ringbuf::HeapCons<f32>) {

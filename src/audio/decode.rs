@@ -3,6 +3,7 @@ use crate::audio::constants::{FFT_CHUNK_SIZE, INTERNAL_CHANNELS, INTERNAL_SAMPLE
 use std::{collections::VecDeque, fs::File, path::Path, thread, time::Duration};
 
 use audioadapter_buffers::direct::InterleavedSlice;
+use crossbeam_channel::{Receiver, Sender};
 use reqwest::header::CONTENT_TYPE;
 use ringbuf::traits::Producer;
 use rubato::{Fft, FixedSync, Indexing, Resampler};
@@ -105,7 +106,12 @@ fn open_media(path: &str) -> DecodeResult<(Box<dyn MediaSource>, Hint)> {
     }
 }
 
-pub fn decode_thread(path: &str, mut producer: ringbuf::HeapProd<f32>) -> DecodeResult<()> {
+pub fn decode_thread(
+    path: &str,
+    mut producer: ringbuf::HeapProd<f32>,
+    shutdown_rx: Receiver<()>,
+    finished_tx: Sender<()>,
+) -> DecodeResult<()> {
     let (source, hint) = open_media(path)?;
     let mss = MediaSourceStream::new(source, Default::default());
 
@@ -132,32 +138,27 @@ pub fn decode_thread(path: &str, mut producer: ringbuf::HeapProd<f32>) -> Decode
     let mut resampler = None;
 
     loop {
+        if shutdown_rx.try_recv().is_ok() {
+            break;
+        }
         let packet = match format.next_packet() {
             Ok(packet) => packet,
             Err(_) => break,
         };
-
         if packet.track_id() != track_id {
             continue;
         }
-
         let decoded = match decoder.decode(&packet) {
             Ok(decoded) => decoded,
             Err(symphonia::core::errors::Error::DecodeError(_)) => continue,
             Err(_) => return Err(DecodeError::Decode),
         };
-
         let spec = *decoded.spec();
-
         let input_rate = spec.rate;
         let input_channels = spec.channels.count();
-
         let mut buf = SampleBuffer::<f32>::new(decoded.capacity() as u64, spec);
-
         buf.copy_interleaved_ref(decoded);
-
         let samples = buf.samples();
-
         let normalized_samples = if input_channels == 1 {
             let mut stereo = Vec::with_capacity(samples.len() * 2);
 
@@ -170,7 +171,6 @@ pub fn decode_thread(path: &str, mut producer: ringbuf::HeapProd<f32>) -> Decode
         } else {
             samples.to_vec()
         };
-
         if input_rate == INTERNAL_SAMPLE_RATE {
             for &sample in &normalized_samples {
                 loop {
@@ -186,7 +186,6 @@ pub fn decode_thread(path: &str, mut producer: ringbuf::HeapProd<f32>) -> Decode
 
             continue;
         }
-
         if current_rate != Some(input_rate) {
             accumulation.clear();
 
@@ -204,15 +203,10 @@ pub fn decode_thread(path: &str, mut producer: ringbuf::HeapProd<f32>) -> Decode
 
             current_rate = Some(input_rate);
         }
-
         let resampler = resampler.as_mut().unwrap();
-
         accumulation.extend(normalized_samples);
-
         let needed_frames = resampler.input_frames_next();
-
         let needed_samples = needed_frames * INTERNAL_CHANNELS as usize;
-
         while accumulation.len() >= needed_samples {
             let mut chunk = Vec::<f32>::with_capacity(needed_samples);
 
@@ -244,18 +238,29 @@ pub fn decode_thread(path: &str, mut producer: ringbuf::HeapProd<f32>) -> Decode
                 Some(&indexing),
             ) {
                 Ok(v) => v,
-
-                Err(_) => continue,
+                Err(err) => {
+                    eprintln!("Resampler process error: {err}");
+                    continue;
+                }
             };
 
             let output_samples = &out[..written_frames * INTERNAL_CHANNELS as usize];
 
             for &sample in output_samples {
+                if shutdown_rx.try_recv().is_ok() {
+                    let _ = finished_tx.send(());
+                    return Ok(());
+                }
+
                 loop {
                     match producer.try_push(sample) {
                         Ok(_) => break,
-
                         Err(_) => {
+                            if shutdown_rx.try_recv().is_ok() {
+                                let _ = finished_tx.send(());
+
+                                return Ok(());
+                            }
                             thread::sleep(Duration::from_micros(100));
                         }
                     }
@@ -307,7 +312,6 @@ pub fn decode_thread(path: &str, mut producer: ringbuf::HeapProd<f32>) -> Decode
                     loop {
                         match producer.try_push(sample) {
                             Ok(_) => break,
-
                             Err(_) => {
                                 thread::sleep(Duration::from_micros(100));
                             }
@@ -318,5 +322,6 @@ pub fn decode_thread(path: &str, mut producer: ringbuf::HeapProd<f32>) -> Decode
         }
     }
 
+    let _ = finished_tx.send(());
     Ok(())
 }
