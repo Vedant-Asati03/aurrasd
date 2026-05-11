@@ -1,17 +1,14 @@
-use std::fmt::Display;
-
 #[derive(Clone, Debug)]
 pub struct AudioFormat {
     pub channels: u16,
     pub sample_rate: u32,
 }
 
-impl Display for AudioFormat {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(
-            f,
-            "AudioFormat(channels: {}, sample_rate: {} Hz)",
-            self.channels, self.sample_rate
-        )
+impl AudioFormat {
+    pub fn new(channels: u16, sample_rate: u32) -> Self {
+        Self {
+            channels: channels,
+            sample_rate: sample_rate,
+        }
     }
 }

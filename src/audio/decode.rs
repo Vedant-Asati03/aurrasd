@@ -1,4 +1,4 @@
-use crate::audio::constants::{FFT_CHUNK_SIZE, INTERNAL_CHANNELS, INTERNAL_SAMPLE_RATE};
+use crate::audio::constants::{FFT_CHUNK_SIZE, INTERNAL_FORMAT};
 
 use std::{collections::VecDeque, fs::File, path::Path, thread, time::Duration};
 
@@ -171,7 +171,7 @@ pub fn decode_thread(
         } else {
             samples.to_vec()
         };
-        if input_rate == INTERNAL_SAMPLE_RATE {
+        if input_rate == INTERNAL_FORMAT.sample_rate {
             for &sample in &normalized_samples {
                 loop {
                     match producer.try_push(sample) {
@@ -192,10 +192,10 @@ pub fn decode_thread(
             resampler = Some(
                 Fft::<f32>::new(
                     input_rate as usize,
-                    INTERNAL_SAMPLE_RATE as usize,
+                    INTERNAL_FORMAT.sample_rate as usize,
                     FFT_CHUNK_SIZE,
-                    INTERNAL_CHANNELS as usize,
-                    INTERNAL_CHANNELS as usize,
+                    INTERNAL_FORMAT.channels as usize,
+                    INTERNAL_FORMAT.channels as usize,
                     FixedSync::Input,
                 )
                 .unwrap(),
@@ -206,7 +206,7 @@ pub fn decode_thread(
         let resampler = resampler.as_mut().unwrap();
         accumulation.extend(normalized_samples);
         let needed_frames = resampler.input_frames_next();
-        let needed_samples = needed_frames * INTERNAL_CHANNELS as usize;
+        let needed_samples = needed_frames * INTERNAL_FORMAT.channels as usize;
         while accumulation.len() >= needed_samples {
             let mut chunk = Vec::<f32>::with_capacity(needed_samples);
 
@@ -215,15 +215,19 @@ pub fn decode_thread(
             }
 
             let input_adapter =
-                InterleavedSlice::new(&chunk, INTERNAL_CHANNELS as usize, needed_frames).unwrap();
+                InterleavedSlice::new(&chunk, INTERNAL_FORMAT.channels as usize, needed_frames)
+                    .unwrap();
 
             let output_frames = resampler.output_frames_max();
 
-            let mut out = vec![0.0f32; output_frames * INTERNAL_CHANNELS as usize];
+            let mut out = vec![0.0f32; output_frames * INTERNAL_FORMAT.channels as usize];
 
-            let mut output_adapter =
-                InterleavedSlice::new_mut(&mut out, INTERNAL_CHANNELS as usize, output_frames)
-                    .unwrap();
+            let mut output_adapter = InterleavedSlice::new_mut(
+                &mut out,
+                INTERNAL_FORMAT.channels as usize,
+                output_frames,
+            )
+            .unwrap();
 
             let indexing = Indexing {
                 input_offset: 0,
@@ -244,7 +248,7 @@ pub fn decode_thread(
                 }
             };
 
-            let output_samples = &out[..written_frames * INTERNAL_CHANNELS as usize];
+            let output_samples = &out[..written_frames * INTERNAL_FORMAT.channels as usize];
 
             for &sample in output_samples {
                 if shutdown_rx.try_recv().is_ok() {
@@ -272,7 +276,7 @@ pub fn decode_thread(
     if let Some(resampler) = resampler.as_mut() {
         let needed_frames = resampler.input_frames_next();
 
-        let needed_samples = needed_frames * INTERNAL_CHANNELS as usize;
+        let needed_samples = needed_frames * INTERNAL_FORMAT.channels as usize;
 
         if !accumulation.is_empty() {
             while accumulation.len() < needed_samples {
@@ -286,15 +290,19 @@ pub fn decode_thread(
             }
 
             let input_adapter =
-                InterleavedSlice::new(&chunk, INTERNAL_CHANNELS as usize, needed_frames).unwrap();
+                InterleavedSlice::new(&chunk, INTERNAL_FORMAT.channels as usize, needed_frames)
+                    .unwrap();
 
             let output_frames = resampler.output_frames_max();
 
-            let mut out = vec![0.0f32; output_frames * INTERNAL_CHANNELS as usize];
+            let mut out = vec![0.0f32; output_frames * INTERNAL_FORMAT.channels as usize];
 
-            let mut output_adapter =
-                InterleavedSlice::new_mut(&mut out, INTERNAL_CHANNELS as usize, output_frames)
-                    .unwrap();
+            let mut output_adapter = InterleavedSlice::new_mut(
+                &mut out,
+                INTERNAL_FORMAT.channels as usize,
+                output_frames,
+            )
+            .unwrap();
 
             let indexing = Indexing {
                 input_offset: 0,
@@ -306,7 +314,7 @@ pub fn decode_thread(
             if let Ok((_, written_frames)) =
                 resampler.process_into_buffer(&input_adapter, &mut output_adapter, Some(&indexing))
             {
-                let output_samples = &out[..written_frames * INTERNAL_CHANNELS as usize];
+                let output_samples = &out[..written_frames * INTERNAL_FORMAT.channels as usize];
 
                 for &sample in output_samples {
                     loop {
