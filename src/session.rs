@@ -28,9 +28,15 @@ impl PlaybackSession {
 
 impl PlaybackSession {
     pub fn stop(session: PlaybackSession) {
-        let _ = session.shutdown_rx.send(());
-        let _ = session.finished_tx.recv_timeout(Duration::from_secs(2));
+        if let Err(err) = session.shutdown_rx.send(()) {
+            tracing::error!("Failed to send shutdown signal: {err:#}");
+        }
+        if let Err(err) = session.finished_tx.recv_timeout(Duration::from_secs(2)) {
+            tracing::error!("Failed to wait for playback to finish: {err:#}");
+        }
         drop(session.stream);
-        let _ = session.decode_thread.join();
+        if let Err(err) = session.decode_thread.join() {
+            tracing::error!("Failed to join decode thread: {:?}", err);
+        }
     }
 }

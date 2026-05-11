@@ -17,7 +17,15 @@ pub fn run_control_loop(cmd_rx: Receiver<Command>) -> Result<()> {
     let mut current_session: Option<PlaybackSession> = None;
 
     loop {
-        let command = cmd_rx.recv()?;
+        let command = match cmd_rx.recv() {
+            Ok(cmd) => cmd,
+            Err(_) => {
+                if let Some(session) = current_session.take() {
+                    PlaybackSession::stop(session);
+                }
+                return Ok(());
+            }
+        };
 
         match command {
             Command::Play(path) => {
@@ -33,14 +41,14 @@ pub fn run_control_loop(cmd_rx: Receiver<Command>) -> Result<()> {
 
                 let decode_thread = thread::spawn(move || {
                     if let Err(err) = decode_thread(&path_str, producer, shutdown_rx, finished_tx) {
-                        eprintln!("Decode error: {err:#}");
+                        tracing::error!("Decode error: {err:#}");
                     }
                 });
 
                 let stream = match play_audio(consumer) {
                     Ok(stream) => stream,
                     Err(err) => {
-                        eprintln!("Playback error: {err:#}");
+                        tracing::error!("Playback error: {err:#}");
                         continue;
                     }
                 };
@@ -60,14 +68,18 @@ pub fn run_control_loop(cmd_rx: Receiver<Command>) -> Result<()> {
             }
 
             Command::Pause => {
-                if let Some(session) = &current_session {
-                    let _ = session.stream.pause();
+                if let Some(session) = &current_session
+                    && let Err(err) = session.stream.pause()
+                {
+                    tracing::error!("Failed to pause stream: {err:#}");
                 }
             }
 
             Command::Resume => {
-                if let Some(session) = &current_session {
-                    let _ = session.stream.play();
+                if let Some(session) = &current_session
+                    && let Err(err) = session.stream.play()
+                {
+                    tracing::error!("Failed to resume stream: {err:#}");
                 }
             }
 
