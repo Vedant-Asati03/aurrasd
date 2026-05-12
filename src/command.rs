@@ -1,8 +1,6 @@
-use std::path::PathBuf;
-
 #[derive(Debug)]
 pub enum Command {
-    Play(PathBuf),
+    Play(String),
     Stop,
     Pause,
     Resume,

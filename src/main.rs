@@ -1,4 +1,4 @@
-use aurrasd::{command::Command, control::run_control_loop};
+use aurrasd::{command::Command, control::run_control_loop, event::Event};
 
 use std::{
     sync::Arc,
@@ -17,6 +17,7 @@ fn main() -> anyhow::Result<()> {
         .init();
 
     let (cmd_tx, cmd_rx) = bounded::<Command>(16);
+    let (event_tx, event_rx) = bounded::<Event>(16);
 
     let running = Arc::new(AtomicBool::new(true));
     let r = Arc::clone(&running);
@@ -25,8 +26,14 @@ fn main() -> anyhow::Result<()> {
         r.store(false, Ordering::SeqCst);
     })?;
 
+    let event_handle = thread::spawn(move || {
+        while let Ok(event) = event_rx.recv() {
+            tracing::info!("Event: {:?}", event);
+        }
+    });
+
     let control_handle = thread::spawn(move || {
-        if let Err(e) = run_control_loop(cmd_rx) {
+        if let Err(e) = run_control_loop(cmd_rx, event_tx) {
             tracing::error!("Control thread error: {e:#}");
         }
     });
@@ -35,7 +42,7 @@ fn main() -> anyhow::Result<()> {
         .nth(1)
         .unwrap_or_else(|| String::from("nature-intro.wav"));
 
-    cmd_tx.send(Command::Play(path.into()))?;
+    cmd_tx.send(Command::Play(path))?;
 
     while running.load(Ordering::SeqCst) {
         thread::sleep(Duration::from_millis(100));
@@ -43,6 +50,7 @@ fn main() -> anyhow::Result<()> {
 
     drop(cmd_tx);
     let _ = control_handle.join();
+    let _ = event_handle.join();
 
     Ok(())
 }
