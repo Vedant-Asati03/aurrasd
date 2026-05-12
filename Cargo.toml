@@ -6,6 +6,7 @@ edition = "2024"
 [dependencies]
 anyhow = "1.0.102"
 audioadapter-buffers = "3.0.0"
+bytemuck = "1.25.0"
 clap = { version = "4.6.1", features = ["derive"] }
 cpal = "0.17.3"
 crossbeam-channel = "0.5.15"
