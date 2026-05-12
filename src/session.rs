@@ -6,8 +6,8 @@ use crossbeam_channel::{Receiver, Sender};
 pub struct PlaybackSession {
     pub stream: Stream,
     pub decode_thread: JoinHandle<()>,
-    pub shutdown_rx: Sender<()>,
-    pub finished_tx: Receiver<()>,
+    pub shutdown_tx: Sender<()>,
+    pub finished_rx: Receiver<()>,
 }
 
 impl PlaybackSession {
@@ -20,20 +20,24 @@ impl PlaybackSession {
         Self {
             stream,
             decode_thread,
-            shutdown_rx: shutdown_tx,
-            finished_tx: finished_rx,
+            shutdown_tx,
+            finished_rx,
         }
     }
 }
 
 impl PlaybackSession {
     pub fn stop(session: PlaybackSession) {
-        if let Err(err) = session.shutdown_rx.send(()) {
-            tracing::error!("Failed to send shutdown signal: {err:#}");
+        let _ = session.shutdown_tx.send(());
+
+        match session.finished_rx.recv_timeout(Duration::from_secs(2)) {
+            Ok(_) => {}
+            Err(crossbeam_channel::RecvTimeoutError::Timeout) => {
+                tracing::warn!("Timeout waiting for decode thread to cleanly finish");
+            }
+            Err(crossbeam_channel::RecvTimeoutError::Disconnected) => {}
         }
-        if let Err(err) = session.finished_tx.recv_timeout(Duration::from_secs(2)) {
-            tracing::error!("Failed to wait for playback to finish: {err:#}");
-        }
+
         drop(session.stream);
         if let Err(err) = session.decode_thread.join() {
             tracing::error!("Failed to join decode thread: {:?}", err);
