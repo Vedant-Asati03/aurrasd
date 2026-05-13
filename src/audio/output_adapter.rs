@@ -1,7 +1,4 @@
-use crate::audio::{
-    constants::{FFT_CHUNK_SIZE, INTERNAL_FORMAT},
-    types::AudioFormat,
-};
+use crate::audio::{AudioFormat, FFT_CHUNK_SIZE, INTERNAL_FORMAT};
 
 use audioadapter_buffers::direct::InterleavedSlice;
 use ringbuf::{
