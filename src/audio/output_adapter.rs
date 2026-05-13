@@ -1,21 +1,14 @@
 use crate::audio::{AudioFormat, FFT_CHUNK_SIZE, INTERNAL_FORMAT};
 
 use audioadapter_buffers::direct::InterleavedSlice;
-use ringbuf::{
-    HeapRb,
-    traits::{Consumer, Observer, Producer},
-};
+use ringbuf::traits::Consumer;
 use rubato::{Fft, FixedSync, Indexing, Resampler};
 
 pub struct OutputAdapter {
     device_format: AudioFormat,
     resampler: Option<Fft<f32>>,
-    accumulation: HeapRb<f32>,
-    output_buffer: HeapRb<f32>,
-    scratch_in: Vec<f32>,
-    scratch_out: Vec<f32>,
-    scratch_mono: Vec<f32>,
-    scratch_stereo: Vec<f32>,
+    accum: Vec<f32>,
+    scratch: Vec<f32>,
 }
 
 impl OutputAdapter {
@@ -38,137 +31,189 @@ impl OutputAdapter {
             None
         };
 
+        let scratch_capacity = if needs_resample {
+            // resampler output_frames_max * channels — conservative upper bound
+            FFT_CHUNK_SIZE * 4 * INTERNAL_FORMAT.channels as usize
+        } else {
+            // cpal callback is typically ~512-2048 frames
+            4096 * INTERNAL_FORMAT.channels as usize
+        };
+
         Self {
             device_format,
             resampler,
-            accumulation: HeapRb::new(65536),
-            output_buffer: HeapRb::new(65536),
-            scratch_in: Vec::with_capacity(65536),
-            scratch_out: Vec::with_capacity(65536),
-            scratch_mono: Vec::with_capacity(65536),
-            scratch_stereo: Vec::with_capacity(65536),
+            accum: Vec::new(),
+            scratch: Vec::with_capacity(scratch_capacity),
         }
+    }
+
+    /// Fill `output` directly from `consumer`, resampling and converting channels inline.
+    /// Zeros any frames that couldn't be filled (underrun).
+    pub fn fill_buffer(&mut self, consumer: &mut ringbuf::HeapCons<f32>, output: &mut [f32]) {
+        let ch = INTERNAL_FORMAT.channels as usize;
+        let filled = if let Some(resampler) = self.resampler.as_mut() {
+            fill_with_resample(
+                consumer,
+                output,
+                resampler,
+                &mut self.accum,
+                &mut self.scratch,
+                ch,
+                &self.device_format,
+            )
+        } else {
+            fill_direct(consumer, output, ch, &self.device_format)
+        };
+
+        output[filled..].fill(0.0);
     }
 }
 
-impl OutputAdapter {
-    pub fn fill_buffer(&mut self, consumer: &mut ringbuf::HeapCons<f32>, output: &mut [f32]) {
-        while self.output_buffer.occupied_len() < output.len() {
-            let produced_any = self.process_one_chunk();
+/// Direct path: no resampling needed. Pull samples from ring buffer, convert channels inline.
+fn fill_direct(
+    consumer: &mut ringbuf::HeapCons<f32>,
+    output: &mut [f32],
+    internal_ch: usize,
+    device_format: &AudioFormat,
+) -> usize {
+    let device_ch = device_format.channels as usize;
+    let out_frames = output.len() / device_ch;
 
-            if !produced_any {
-                let mut fetched = false;
-                for _ in 0..1024 {
-                    if let Some(s) = consumer.try_pop() {
-                        let _ = self.accumulation.try_push(s);
-                        fetched = true;
-                    } else {
-                        break;
+    match (internal_ch, device_ch) {
+        (2, 2) | (1, 1) => {
+            // Exact match — read directly into output
+            let mut written = 0;
+            while written < output.len() {
+                match consumer.try_pop() {
+                    Some(s) => {
+                        output[written] = s;
+                        written += 1;
                     }
-                }
-                if !fetched {
-                    break;
+                    None => return written,
                 }
             }
+            written
         }
+        (2, 1) => {
+            // Stereo → mono: mix down pairs
+            let mut written = 0;
+            for frame in 0..out_frames {
+                match (consumer.try_pop(), consumer.try_pop()) {
+                    (Some(l), Some(r)) => {
+                        output[frame] = (l + r) * 0.5;
+                        written += 1;
+                    }
+                    _ => return written,
+                }
+            }
+            written
+        }
+        (1, 2) => {
+            // Mono → stereo: duplicate
+            let mut written = 0;
+            for frame in 0..out_frames {
+                match consumer.try_pop() {
+                    Some(s) => {
+                        output[frame * 2] = s;
+                        output[frame * 2 + 1] = s;
+                        written += 2;
+                    }
+                    None => return written,
+                }
+            }
+            written
+        }
+        _ => 0,
+    }
+}
 
-        let to_copy = std::cmp::min(self.output_buffer.occupied_len(), output.len());
-        for i in 0..to_copy {
-            output[i] = self.output_buffer.try_pop().unwrap();
-        }
-        for i in to_copy..output.len() {
-            output[i] = 0.0;
-        }
+/// Resampling path: accumulate into `accum`, process chunks, write converted output inline.
+fn fill_with_resample(
+    consumer: &mut ringbuf::HeapCons<f32>,
+    output: &mut [f32],
+    resampler: &mut Fft<f32>,
+    accum: &mut Vec<f32>,
+    scratch: &mut Vec<f32>,
+    internal_ch: usize,
+    device_format: &AudioFormat,
+) -> usize {
+    while let Some(s) = consumer.try_pop() {
+        accum.push(s);
     }
 
-    fn process_one_chunk(&mut self) -> bool {
-        let processed: &[f32] = if let Some(resampler) = self.resampler.as_mut() {
-            let needed_frames = resampler.input_frames_next();
-            let needed_samples = needed_frames * INTERNAL_FORMAT.channels as usize;
+    let device_ch = device_format.channels as usize;
+    let mut out_pos = 0;
 
-            if self.accumulation.occupied_len() < needed_samples {
-                return false;
-            }
+    loop {
+        let needed_frames = resampler.input_frames_next();
+        let needed_samples = needed_frames * internal_ch;
 
-            self.scratch_in.clear();
-            for _ in 0..needed_samples {
-                self.scratch_in.push(self.accumulation.try_pop().unwrap());
-            }
+        if accum.len() < needed_samples {
+            break;
+        }
 
-            let input_adapter = InterleavedSlice::new(
-                &self.scratch_in,
-                INTERNAL_FORMAT.channels as usize,
-                needed_frames,
-            )
-            .unwrap();
+        let output_frames = resampler.output_frames_max();
+        let output_samples = output_frames * internal_ch;
+        scratch.resize(output_samples, 0.0);
 
-            let output_frames = resampler.output_frames_max();
-            let needed_out_samples = output_frames * INTERNAL_FORMAT.channels as usize;
+        let input_adapter =
+            InterleavedSlice::new(&accum[..needed_samples], internal_ch, needed_frames).unwrap();
+        let mut output_adapter =
+            InterleavedSlice::new_mut(scratch, internal_ch, output_frames).unwrap();
 
-            self.scratch_out.clear();
-            self.scratch_out.resize(needed_out_samples, 0.0);
-
-            let mut output_adapter = InterleavedSlice::new_mut(
-                &mut self.scratch_out,
-                INTERNAL_FORMAT.channels as usize,
-                output_frames,
-            )
-            .unwrap();
-
-            let indexing = Indexing {
-                input_offset: 0,
-                output_offset: 0,
-                active_channels_mask: None,
-                partial_len: None,
-            };
-
-            let (_, written_frames) = match resampler.process_into_buffer(
-                &input_adapter,
-                &mut output_adapter,
-                Some(&indexing),
-            ) {
-                Ok(v) => v,
-                Err(_) => return false,
-            };
-
-            self.scratch_out
-                .truncate(written_frames * INTERNAL_FORMAT.channels as usize);
-
-            &self.scratch_out[..]
-        } else {
-            if self.accumulation.is_empty() {
-                return false;
-            }
-            self.scratch_out.clear();
-            while let Some(v) = self.accumulation.try_pop() {
-                self.scratch_out.push(v);
-            }
-            &self.scratch_out[..]
+        let indexing = Indexing {
+            input_offset: 0,
+            output_offset: 0,
+            active_channels_mask: None,
+            partial_len: None,
         };
 
-        if self.device_format.channels == 1 {
-            self.scratch_mono.clear();
-            for frame in processed.chunks_exact(2) {
-                self.scratch_mono.push((frame[0] + frame[1]) * 0.5);
+        let written_frames = match resampler.process_into_buffer(
+            &input_adapter,
+            &mut output_adapter,
+            Some(&indexing),
+        ) {
+            Ok((_, w)) => w,
+            Err(_) => break,
+        };
+
+        accum.drain(..needed_samples);
+
+        let resampled = &scratch[..written_frames * internal_ch];
+        let space_left = output.len() - out_pos;
+
+        match (internal_ch, device_ch) {
+            (2, 2) | (1, 1) => {
+                let to_copy = resampled.len().min(space_left);
+                output[out_pos..out_pos + to_copy].copy_from_slice(&resampled[..to_copy]);
+                out_pos += to_copy;
             }
-            for &s in &self.scratch_mono {
-                let _ = self.output_buffer.try_push(s);
+            (2, 1) => {
+                for frame in resampled.chunks_exact(2) {
+                    if out_pos >= output.len() {
+                        break;
+                    }
+                    output[out_pos] = (frame[0] + frame[1]) * 0.5;
+                    out_pos += 1;
+                }
             }
-        } else if self.device_format.channels == 2 && INTERNAL_FORMAT.channels == 1 {
-            self.scratch_stereo.clear();
-            for &sample in processed {
-                self.scratch_stereo.push(sample);
-                self.scratch_stereo.push(sample);
+            (1, 2) => {
+                for &s in resampled {
+                    if out_pos + 1 >= output.len() {
+                        break;
+                    }
+                    output[out_pos] = s;
+                    output[out_pos + 1] = s;
+                    out_pos += 2;
+                }
             }
-            for &s in &self.scratch_stereo {
-                let _ = self.output_buffer.try_push(s);
-            }
-        } else {
-            for &s in processed {
-                let _ = self.output_buffer.try_push(s);
-            }
+            _ => break,
         }
 
-        true
+        if out_pos >= output.len() {
+            break;
+        }
     }
+
+    out_pos
 }
