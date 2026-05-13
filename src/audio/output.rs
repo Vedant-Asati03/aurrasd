@@ -1,13 +1,8 @@
 use crate::audio::{
-    AudioFormat, INTERNAL_BUFFER_SECONDS, INTERNAL_FORMAT, PREBUFFER_MS,
-    output_adapter::OutputAdapter,
+    AudioFormat, INTERNAL_BUFFER_SECONDS, INTERNAL_FORMAT, output_adapter::OutputAdapter,
 };
 
-use std::{
-    sync::{Arc, atomic},
-    thread,
-    time::Duration,
-};
+use std::sync::{Arc, atomic};
 
 use anyhow::{Context, Result, anyhow};
 use cpal::{
@@ -36,7 +31,6 @@ pub fn select_output_format(device: &Device) -> Result<AudioFormat> {
             && cfg.channels() == INTERNAL_FORMAT.channels
         {
             let min = cfg.min_sample_rate();
-
             let max = cfg.max_sample_rate();
 
             if INTERNAL_FORMAT.sample_rate >= min && INTERNAL_FORMAT.sample_rate <= max {
@@ -66,18 +60,28 @@ pub fn select_output_format(device: &Device) -> Result<AudioFormat> {
     Err(anyhow!("No compatible output format"))
 }
 
-pub fn create_audio_buffer() -> (ringbuf::HeapProd<f32>, ringbuf::HeapCons<f32>) {
+/// Create the ring buffer sized to the *device* sample rate so that the
+/// INTERNAL_BUFFER_SECONDS constant is meaningful even after resampling.
+pub fn create_audio_buffer(
+    device_format: &AudioFormat,
+) -> (ringbuf::HeapProd<f32>, ringbuf::HeapCons<f32>) {
     let capacity = INTERNAL_FORMAT.sample_rate as usize
         * INTERNAL_FORMAT.channels as usize
         * INTERNAL_BUFFER_SECONDS;
 
-    HeapRb::<f32>::new(capacity).split()
+    let device_capacity = device_format.sample_rate as usize
+        * device_format.channels as usize
+        * INTERNAL_BUFFER_SECONDS;
+
+    HeapRb::<f32>::new(capacity.max(device_capacity)).split()
 }
 
 pub fn play_audio(
     mut consumer: ringbuf::HeapCons<f32>,
     eof_flag: Arc<atomic::AtomicBool>,
     drained_tx: crossbeam_channel::Sender<()>,
+    stream_error_tx: crossbeam_channel::Sender<String>,
+    prebuffer_rx: crossbeam_channel::Receiver<()>,
 ) -> Result<cpal::Stream> {
     let device = get_output_device()?;
     let device_format = select_output_format(&device)?;
@@ -88,18 +92,15 @@ pub fn play_audio(
         buffer_size: cpal::BufferSize::Default,
     };
 
-    let prebuffer_samples =
-        (INTERNAL_FORMAT.sample_rate as usize * INTERNAL_FORMAT.channels as usize * PREBUFFER_MS)
-            / 1000;
-
-    while consumer.occupied_len() < prebuffer_samples {
-        thread::sleep(Duration::from_millis(10));
-    }
+    drop(prebuffer_rx);
 
     let mut adapter = OutputAdapter::new(device_format.clone());
 
-    let error_callback = move |err| {
-        tracing::error!("Playback error: {err}");
+    let stream_error_tx_clone = stream_error_tx.clone();
+    let error_callback = move |err: cpal::StreamError| {
+        let msg = format!("Stream error: {err}");
+        tracing::error!("{}", msg);
+        let _ = stream_error_tx_clone.try_send(msg);
     };
 
     let stream = match device_format.sample_format {
@@ -111,7 +112,7 @@ pub fn play_audio(
                     adapter.fill_buffer(&mut consumer, output);
                     if !sent_drained
                         && consumer.is_empty()
-                        && eof_flag.load(atomic::Ordering::Relaxed)
+                        && eof_flag.load(atomic::Ordering::Acquire)
                     {
                         let _ = drained_tx.try_send(());
                         sent_drained = true;
@@ -134,7 +135,7 @@ pub fn play_audio(
                     }
                     if !sent_drained
                         && consumer.is_empty()
-                        && eof_flag.load(atomic::Ordering::Relaxed)
+                        && eof_flag.load(atomic::Ordering::Acquire)
                     {
                         let _ = drained_tx.try_send(());
                         sent_drained = true;
@@ -157,7 +158,7 @@ pub fn play_audio(
                     }
                     if !sent_drained
                         && consumer.is_empty()
-                        && eof_flag.load(atomic::Ordering::Relaxed)
+                        && eof_flag.load(atomic::Ordering::Acquire)
                     {
                         let _ = drained_tx.try_send(());
                         sent_drained = true;
