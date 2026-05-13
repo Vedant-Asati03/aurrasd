@@ -4,7 +4,7 @@ use aurrasd::{
 };
 
 use std::{
-    io::Write,
+    io::{BufRead, BufReader, Write},
     sync::{
         Arc, Mutex,
         atomic::{AtomicBool, Ordering},
@@ -13,97 +13,117 @@ use std::{
     time::Duration,
 };
 
+use clap::{Parser, Subcommand};
 use crossbeam_channel::bounded;
-use interprocess::local_socket::{GenericFilePath, GenericNamespaced, Stream, prelude::*};
+use interprocess::{
+    TryClone,
+    local_socket::{GenericFilePath, GenericNamespaced, Stream, prelude::*},
+};
 
-fn show_help() {
-    println!("aurrasd [OPTIONS] <COMMAND> [ARGS]");
-    println!();
-    println!("A simple audio playback daemon");
-    println!();
-    println!("Commands:");
-    println!("  play <path>       - Play the specified audio file immediately");
-    println!("  pause             - Pause playback");
-    println!("  resume            - Resume playback");
-    println!("  stop              - Stop playback");
-    println!("  next              - Skip to the next track in the queue");
-    println!("  prev | previous   - Go back to the previous track in the queue");
-    println!("  clear             - Clear the playback queue");
-    println!("  enqueue <path>    - Add the specified audio file to the end of the queue");
-    println!("  volume <0.0-1.0>  - Set the playback volume (0.0 = mute, 1.0 = max)");
-    println!();
-    println!("Options:");
-    println!("  daemon            - Run in daemon mode (default)");
-    println!("  help              - Show this help message");
-
-    std::process::exit(0);
+#[derive(Parser)]
+#[command(name = "aurrasd", version, about = "A simple audio player backend")]
+struct Cli {
+    #[command(subcommand)]
+    command: Option<CliCommand>,
 }
 
-fn handle_args(args: Vec<String>) -> anyhow::Result<bool> {
-    if args.len() > 1 && args[1] != "daemon" {
-        let cmd = match args[1].as_str() {
-            "help" => {
-                show_help();
-                return Ok(true);
-            }
-            "play" => {
-                if args.len() < 3 {
-                    anyhow::bail!("Usage: aurrasd play <path>");
-                }
-                Command::Play(args[2].clone())
-            }
-            "pause" => Command::Pause,
-            "resume" => Command::Resume,
-            "stop" => Command::Stop,
-            "next" => Command::Next,
-            "prev" | "previous" => Command::Previous,
-            "clear" => Command::ClearQueue,
-            "enqueue" => {
-                if args.len() < 3 {
-                    anyhow::bail!("Usage: aurrasd enqueue <path>");
-                }
-                Command::Enqueue(args[2].clone())
-            }
-            "volume" => {
-                if args.len() < 3 {
-                    anyhow::bail!("Usage: aurrasd volume <0.0-1.0>");
-                }
-                let v: f32 = args[2].parse()?;
-                Command::SetVolume(v)
-            }
-            _ => anyhow::bail!("Unknown command: {}", args[1]),
-        };
+#[derive(Subcommand)]
+pub enum CliCommand {
+    /// Play the specified audio file immediately
+    Play { path: String },
+    /// Pause playback
+    Pause,
+    /// Resume playback
+    Resume,
+    /// Stop playback
+    Stop,
+    /// Skip to the next track in the queue
+    Next,
+    /// Go back to the previous track in the queue
+    #[command(alias = "previous")]
+    Prev,
+    /// Clear the playback queue
+    Clear,
+    /// Add the specified audio file to the end of the queue
+    Enqueue { path: String },
+    /// Set the playback volume (0.0 = mute, 1.0 = max)
+    Volume { level: f32 },
+    /// Show current playback state and queue
+    Status,
+    /// Run in daemon mode (default if no command provided)
+    Daemon,
+}
 
-        let name = if GenericNamespaced::is_supported() {
-            "aurrasd.sock".to_ns_name::<GenericNamespaced>().unwrap()
-        } else {
-            std::env::temp_dir()
-                .join("aurrasd.sock")
-                .to_string_lossy()
-                .into_owned()
-                .to_fs_name::<GenericFilePath>()
-                .unwrap()
-        };
+fn handle_cli_client(cli_cmd: CliCommand) -> anyhow::Result<()> {
+    let cmd = match cli_cmd {
+        CliCommand::Play { path } => Command::Play(path),
+        CliCommand::Pause => Command::Pause,
+        CliCommand::Resume => Command::Resume,
+        CliCommand::Stop => Command::Stop,
+        CliCommand::Next => Command::Next,
+        CliCommand::Prev => Command::Previous,
+        CliCommand::Clear => Command::ClearQueue,
+        CliCommand::Enqueue { path } => Command::Enqueue(path),
+        CliCommand::Volume { level } => Command::SetVolume(level),
+        CliCommand::Status => Command::GetState,
+        CliCommand::Daemon => return Ok(()),
+    };
 
-        match Stream::connect(name.clone()) {
-            Ok(mut stream) => {
-                let json = serde_json::to_string(&cmd)?;
-                writeln!(stream, "{}", json)?;
-            }
-            Err(_) => {
-                eprintln!("Daemon is not running. Could not connect to socket.");
-                std::process::exit(1);
+    let name = if GenericNamespaced::is_supported() {
+        "aurrasd.sock".to_ns_name::<GenericNamespaced>().unwrap()
+    } else {
+        std::env::temp_dir()
+            .join("aurrasd.sock")
+            .to_string_lossy()
+            .into_owned()
+            .to_fs_name::<GenericFilePath>()
+            .unwrap()
+    };
+
+    match Stream::connect(name.clone()) {
+        Ok(mut stream) => {
+            let json = serde_json::to_string(&cmd)?;
+            writeln!(stream, "{}", json)?;
+
+            if let Command::GetState = cmd {
+                let reader = BufReader::new(stream.try_clone().expect("Failed to clone stream"));
+                for line_result in reader.lines() {
+                    if let Ok(line) = line_result {
+                        if let Ok(Event::FullState(state)) = serde_json::from_str::<Event>(&line) {
+                            println!("Status: {:?}", state.status);
+                            if state.queue.is_empty() {
+                                println!("Queue is empty.");
+                            } else {
+                                println!("Queue ({} items):", state.queue.len());
+                                for (i, track) in state.queue.iter().enumerate() {
+                                    println!("  {}. {}", i + 1, track);
+                                }
+                            }
+                            break;
+                        }
+                    } else {
+                        break;
+                    }
+                }
             }
         }
-        return Ok(true);
+        Err(_) => {
+            eprintln!("Daemon is not running. Could not connect to socket.");
+            std::process::exit(1);
+        }
     }
-    Ok(false)
+
+    Ok(())
 }
 
 fn main() -> anyhow::Result<()> {
-    let args: Vec<String> = std::env::args().collect();
-    if handle_args(args)? {
-        return Ok(());
+    let cli = Cli::parse();
+
+    if let Some(cmd) = cli.command {
+        if !matches!(cmd, CliCommand::Daemon) {
+            handle_cli_client(cmd)?;
+            return Ok(());
+        }
     }
 
     tracing_subscriber::fmt()

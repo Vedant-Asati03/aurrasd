@@ -135,6 +135,9 @@ pub fn run_control_loop(cmd_rx: Receiver<Command>, event_tx: Sender<Event>) -> R
                     player.state.queue.clear();
                     let _ = event_tx.send(Event::QueueUpdated);
                 }
+                Command::GetState => {
+                    let _ = event_tx.send(Event::FullState(player.state.clone()));
+                }
                 Command::SetVolume(_) | Command::Previous => {
                     let _ = event_tx.send(Event::Error("Not yet implemented".into()));
                 }

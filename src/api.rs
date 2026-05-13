@@ -12,6 +12,7 @@ pub enum Command {
     Next,
     Previous,
     ClearQueue,
+    GetState,
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
@@ -24,6 +25,7 @@ pub enum Event {
     Error(String),
     QueueUpdated,
     StateChanged(PlaybackStatus),
+    FullState(PlaybackState),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
