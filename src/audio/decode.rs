@@ -1,9 +1,15 @@
-use crate::audio::constants::{FFT_CHUNK_SIZE, INTERNAL_FORMAT};
+use crate::audio::{FFT_CHUNK_SIZE, INTERNAL_FORMAT};
 
-use std::{fs::File, path::Path, thread, time::Duration};
+use std::{
+    fs::File,
+    path::Path,
+    sync::{Arc, atomic},
+    thread,
+    time::Duration,
+};
 
 use audioadapter_buffers::direct::InterleavedSlice;
-use crossbeam_channel::{Receiver, Sender};
+use crossbeam_channel::Receiver;
 use reqwest::header::CONTENT_TYPE;
 use ringbuf::traits::Producer;
 use rubato::{Fft, FixedSync, Indexing, Resampler};
@@ -108,7 +114,7 @@ pub fn decode_thread(
     path: &str,
     mut producer: ringbuf::HeapProd<f32>,
     shutdown_rx: Receiver<()>,
-    finished_tx: Sender<()>,
+    eof_flag: Arc<atomic::AtomicBool>,
 ) -> DecodeResult<()> {
     let res = match symphonia_decode_thread(path, &mut producer, &shutdown_rx) {
         Ok(()) => Ok(()),
@@ -127,7 +133,8 @@ pub fn decode_thread(
             Err(e)
         }
     };
-    let _ = finished_tx.send(());
+
+    eof_flag.store(true, atomic::Ordering::Release);
     res
 }
 

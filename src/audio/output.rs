@@ -1,10 +1,13 @@
 use crate::audio::{
-    constants::{INTERNAL_BUFFER_SECONDS, INTERNAL_FORMAT, PREBUFFER_MS},
+    AudioFormat, INTERNAL_BUFFER_SECONDS, INTERNAL_FORMAT, PREBUFFER_MS,
     output_adapter::OutputAdapter,
-    types::AudioFormat,
 };
 
-use std::{thread, time::Duration};
+use std::{
+    sync::{Arc, atomic},
+    thread,
+    time::Duration,
+};
 
 use anyhow::{Context, Result, anyhow};
 use cpal::{
@@ -71,7 +74,11 @@ pub fn create_audio_buffer() -> (ringbuf::HeapProd<f32>, ringbuf::HeapCons<f32>)
     HeapRb::<f32>::new(capacity).split()
 }
 
-pub fn play_audio(mut consumer: ringbuf::HeapCons<f32>) -> Result<cpal::Stream> {
+pub fn play_audio(
+    mut consumer: ringbuf::HeapCons<f32>,
+    eof_flag: Arc<atomic::AtomicBool>,
+    drained_tx: crossbeam_channel::Sender<()>,
+) -> Result<cpal::Stream> {
     let device = get_output_device()?;
     let device_format = select_output_format(&device)?;
 
@@ -96,16 +103,27 @@ pub fn play_audio(mut consumer: ringbuf::HeapCons<f32>) -> Result<cpal::Stream> 
     };
 
     let stream = match device_format.sample_format {
-        SampleFormat::F32 => device.build_output_stream(
-            &config,
-            move |output: &mut [f32], _| {
-                adapter.fill_buffer(&mut consumer, output);
-            },
-            error_callback,
-            None,
-        )?,
+        SampleFormat::F32 => {
+            let mut sent_drained = false;
+            device.build_output_stream(
+                &config,
+                move |output: &mut [f32], _| {
+                    adapter.fill_buffer(&mut consumer, output);
+                    if !sent_drained
+                        && consumer.is_empty()
+                        && eof_flag.load(atomic::Ordering::Relaxed)
+                    {
+                        let _ = drained_tx.try_send(());
+                        sent_drained = true;
+                    }
+                },
+                error_callback,
+                None,
+            )?
+        }
         SampleFormat::I16 => {
             let mut temp_buffer = Vec::new();
+            let mut sent_drained = false;
             device.build_output_stream(
                 &config,
                 move |output: &mut [i16], _| {
@@ -114,6 +132,13 @@ pub fn play_audio(mut consumer: ringbuf::HeapCons<f32>) -> Result<cpal::Stream> 
                     for (i, &f) in temp_buffer.iter().enumerate() {
                         output[i] = cpal::Sample::from_sample(f);
                     }
+                    if !sent_drained
+                        && consumer.is_empty()
+                        && eof_flag.load(atomic::Ordering::Relaxed)
+                    {
+                        let _ = drained_tx.try_send(());
+                        sent_drained = true;
+                    }
                 },
                 error_callback,
                 None,
@@ -121,6 +146,7 @@ pub fn play_audio(mut consumer: ringbuf::HeapCons<f32>) -> Result<cpal::Stream> 
         }
         SampleFormat::U16 => {
             let mut temp_buffer = Vec::new();
+            let mut sent_drained = false;
             device.build_output_stream(
                 &config,
                 move |output: &mut [u16], _| {
@@ -128,6 +154,13 @@ pub fn play_audio(mut consumer: ringbuf::HeapCons<f32>) -> Result<cpal::Stream> 
                     adapter.fill_buffer(&mut consumer, &mut temp_buffer);
                     for (i, &f) in temp_buffer.iter().enumerate() {
                         output[i] = cpal::Sample::from_sample(f);
+                    }
+                    if !sent_drained
+                        && consumer.is_empty()
+                        && eof_flag.load(atomic::Ordering::Relaxed)
+                    {
+                        let _ = drained_tx.try_send(());
+                        sent_drained = true;
                     }
                 },
                 error_callback,
