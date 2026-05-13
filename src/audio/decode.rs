@@ -1,4 +1,4 @@
-use crate::audio::{FFT_CHUNK_SIZE, INTERNAL_FORMAT};
+use crate::audio::{ACCUM_MAX_SAMPLES, FFT_CHUNK_SIZE, INTERNAL_FORMAT};
 
 use std::{
     fs::File,
@@ -44,6 +44,10 @@ pub enum DecodeError {
 
     #[error("decode failed")]
     Decode,
+
+    /// FFmpeg binary was not found on PATH.
+    #[error("ffmpeg not found on PATH; install ffmpeg to enable fallback decoding")]
+    FfmpegNotFound,
 }
 
 type DecodeResult<T> = std::result::Result<T, DecodeError>;
@@ -240,6 +244,17 @@ fn symphonia_decode_thread(
 
         normalize_into(samples, input_ch, ch, &mut accum);
 
+        if accum.len() > ACCUM_MAX_SAMPLES {
+            tracing::warn!(
+                "Decode accum exceeded {} samples; dropping oldest frames to prevent OOM",
+                ACCUM_MAX_SAMPLES
+            );
+            let keep = ACCUM_MAX_SAMPLES / 2;
+            let drop_count = accum.len() - keep;
+            let aligned_drop = (drop_count / ch) * ch;
+            accum.drain(..aligned_drop);
+        }
+
         let resampler = resampler.as_mut().unwrap();
         if !flush_resampler(
             resampler,
@@ -299,7 +314,10 @@ where
 }
 
 /// Normalize interleaved `samples` from `input_ch` to `output_ch` channels, appending into `out`.
-fn normalize_into(samples: &[f32], input_ch: usize, output_ch: usize, out: &mut Vec<f32>) {
+///
+/// Down-mixing (input_ch > output_ch): averages all input channels equally into
+/// the available output channels rather than truncating, so no audio is silently lost.
+pub fn normalize_into(samples: &[f32], input_ch: usize, output_ch: usize, out: &mut Vec<f32>) {
     match (input_ch, output_ch) {
         (i, o) if i == o => out.extend_from_slice(samples),
         (1, 2) => {
@@ -310,12 +328,24 @@ fn normalize_into(samples: &[f32], input_ch: usize, output_ch: usize, out: &mut 
             }
         }
         (i, o) if i > o => {
+            // Mix down: distribute all input channels equally across output channels.
+            // e.g. 5.1 -> stereo: L += C*0.5 + LS*0.5, R += C*0.5 + RS*0.5 (equal-power approx)
             out.reserve(samples.len() / i * o);
+            let extra = i - o; // channels that have no direct output slot
+            let scale = 1.0 / (1.0 + extra as f32 / o as f32);
             for frame in samples.chunks_exact(i) {
-                out.extend_from_slice(&frame[..o]);
+                let mut mixed = [0.0f32; 16];
+                let mixed = &mut mixed[..o];
+                for (j, &s) in frame.iter().enumerate() {
+                    mixed[j % o] += s;
+                }
+                for m in mixed.iter_mut() {
+                    out.push(*m * scale);
+                }
             }
         }
         (i, o) => {
+            // Up-mix: zero-pad missing channels.
             out.reserve(samples.len() / i * o);
             for frame in samples.chunks_exact(i) {
                 for j in 0..o {
@@ -395,7 +425,7 @@ fn flush_resampler(
         }
 
         if pad {
-            break; // single flush for the tail
+            break;
         }
     }
 
@@ -407,7 +437,7 @@ fn ffmpeg_decode_thread(
     producer: &mut ringbuf::HeapProd<f32>,
     shutdown_rx: &Receiver<()>,
 ) -> DecodeResult<()> {
-    let mut child = std::process::Command::new("ffmpeg")
+    let mut child = match std::process::Command::new("ffmpeg")
         .args([
             "-v",
             "quiet",
@@ -424,7 +454,15 @@ fn ffmpeg_decode_thread(
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::null())
         .spawn()
-        .map_err(|_| DecodeError::Decoder)?;
+    {
+        Ok(child) => child,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            return Err(DecodeError::FfmpegNotFound);
+        }
+        Err(_) => {
+            return Err(DecodeError::Decoder);
+        }
+    };
 
     let mut stdout = child.stdout.take().unwrap();
     let mut buf = vec![0u8; 4096 * 4];
@@ -440,7 +478,10 @@ fn ffmpeg_decode_thread(
             Ok(0) => break,
             Ok(n) => {
                 let valid_bytes = n - (n % 4);
-                let floats: &[f32] = bytemuck::cast_slice_mut(&mut buf[..valid_bytes]);
+                if valid_bytes == 0 {
+                    continue;
+                }
+                let floats: &[f32] = bytemuck::cast_slice(&buf[..valid_bytes]);
 
                 let mut remaining_floats = floats;
                 while !remaining_floats.is_empty() {

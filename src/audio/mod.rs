@@ -32,3 +32,8 @@ pub const INTERNAL_BUFFER_SECONDS: usize = 4;
 pub const PREBUFFER_MS: usize = 300;
 
 pub const FFT_CHUNK_SIZE: usize = 1024;
+
+/// Maximum number of interleaved f32 samples allowed to accumulate in a
+/// resampler's input buffer before we consider it a runaway growth situation
+/// and stop feeding it.  At 48 kHz stereo that is ~10 seconds of audio.
+pub const ACCUM_MAX_SAMPLES: usize = 48_000 * 2 * 10;

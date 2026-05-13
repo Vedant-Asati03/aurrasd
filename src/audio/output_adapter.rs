@@ -1,4 +1,5 @@
-use crate::audio::{AudioFormat, FFT_CHUNK_SIZE, INTERNAL_FORMAT};
+use crate::audio::decode::normalize_into;
+use crate::audio::{ACCUM_MAX_SAMPLES, AudioFormat, FFT_CHUNK_SIZE, INTERNAL_FORMAT};
 
 use audioadapter_buffers::direct::InterleavedSlice;
 use ringbuf::traits::Consumer;
@@ -32,10 +33,8 @@ impl OutputAdapter {
         };
 
         let scratch_capacity = if needs_resample {
-            // resampler output_frames_max * channels — conservative upper bound
             FFT_CHUNK_SIZE * 4 * INTERNAL_FORMAT.channels as usize
         } else {
-            // cpal callback is typically ~512-2048 frames
             4096 * INTERNAL_FORMAT.channels as usize
         };
 
@@ -81,7 +80,6 @@ fn fill_direct(
 
     match (internal_ch, device_ch) {
         (2, 2) | (1, 1) => {
-            // Exact match — read directly into output
             let mut written = 0;
             while written < output.len() {
                 match consumer.try_pop() {
@@ -123,7 +121,23 @@ fn fill_direct(
             }
             written
         }
-        _ => 0,
+        (i, o) => {
+            let mut temp: Vec<f32> = Vec::with_capacity(out_frames * i);
+            for _ in 0..out_frames * i {
+                match consumer.try_pop() {
+                    Some(s) => temp.push(s),
+                    None => break,
+                }
+            }
+            if temp.is_empty() {
+                return 0;
+            }
+            let mut normalized = Vec::with_capacity(out_frames * o);
+            normalize_into(&temp, i, o, &mut normalized);
+            let to_copy = normalized.len().min(output.len());
+            output[..to_copy].copy_from_slice(&normalized[..to_copy]);
+            to_copy
+        }
     }
 }
 
@@ -139,6 +153,17 @@ fn fill_with_resample(
 ) -> usize {
     while let Some(s) = consumer.try_pop() {
         accum.push(s);
+    }
+
+    if accum.len() > ACCUM_MAX_SAMPLES {
+        tracing::warn!(
+            "Output accum exceeded {} samples; dropping oldest frames to prevent OOM",
+            ACCUM_MAX_SAMPLES
+        );
+        let keep = ACCUM_MAX_SAMPLES / 2;
+        let drop_count = accum.len() - keep;
+        let aligned_drop = (drop_count / internal_ch) * internal_ch;
+        accum.drain(..aligned_drop);
     }
 
     let device_ch = device_format.channels as usize;
@@ -207,7 +232,14 @@ fn fill_with_resample(
                     out_pos += 2;
                 }
             }
-            _ => break,
+            (i, o) => {
+                // General mixdown/upmix via shared helper.
+                let mut normalized = Vec::new();
+                normalize_into(resampled, i, o, &mut normalized);
+                let to_copy = normalized.len().min(space_left);
+                output[out_pos..out_pos + to_copy].copy_from_slice(&normalized[..to_copy]);
+                out_pos += to_copy;
+            }
         }
 
         if out_pos >= output.len() {
