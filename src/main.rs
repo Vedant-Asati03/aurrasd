@@ -83,11 +83,15 @@ fn handle_args(args: Vec<String>) -> anyhow::Result<bool> {
             _ => anyhow::bail!("Unknown command: {}", args[1]),
         };
 
-        if let Ok(mut stream) = TcpStream::connect("127.0.0.1:28772") {
-            let json = serde_json::to_string(&cmd)?;
-            writeln!(stream, "{}", json)?;
-        } else {
-            eprintln!("Daemon is not running. Could not connect to 127.0.0.1:28772");
+        match TcpStream::connect("127.0.0.1:28772") {
+            Ok(mut stream) => {
+                let json = serde_json::to_string(&cmd)?;
+                writeln!(stream, "{}", json)?;
+            }
+            Err(_) => {
+                eprintln!("Daemon is not running. Could not connect to 127.0.0.1:28772");
+                std::process::exit(1);
+            }
         }
         return Ok(true);
     }
@@ -122,7 +126,7 @@ fn main() -> anyhow::Result<()> {
     let clients_for_events = Arc::clone(&active_clients);
     let event_handle = thread::Builder::new()
         .name("events".into())
-        .stack_size(1 * 1024 * 1024)
+        .stack_size(1024 * 1024)
         .spawn(move || {
             while let Ok(event) = event_rx.recv() {
                 tracing::info!("Event: {:?}", event);
@@ -162,6 +166,7 @@ fn main() -> anyhow::Result<()> {
         thread::sleep(Duration::from_millis(100));
     }
 
+    tracing::info!("Shutting down...");
     drop(cmd_tx);
     let _ = control_handle.join();
     let _ = event_handle.join();
