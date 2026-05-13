@@ -45,7 +45,10 @@ pub fn start_ipc_server(cmd_tx: Sender<Command>, clients: Arc<Mutex<Vec<TcpStrea
                     }
 
                     let tx = cmd_tx.clone();
-                    thread::spawn(move || {
+                    let _ = thread::Builder::new()
+                        .name(format!("ipc-{}", peer_addr))
+                        .stack_size(512 * 1024)
+                        .spawn(move || {
                         let reader = BufReader::new(stream);
                         for line_result in reader.lines() {
                             match line_result {

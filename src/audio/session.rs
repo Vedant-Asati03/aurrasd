@@ -27,11 +27,15 @@ impl PlaybackSession {
 
         let path_clone = path.to_string();
 
-        let decode_thread = thread::spawn(move || {
-            if let Err(err) = decode_thread(&path_clone, producer, shutdown_rx, eof_flag) {
-                tracing::error!("Decode error: {err:#}");
-            }
-        });
+        let decode_thread = thread::Builder::new()
+            .name("decode".into())
+            .stack_size(2 * 1024 * 1024)
+            .spawn(move || {
+                if let Err(err) = decode_thread(&path_clone, producer, shutdown_rx, eof_flag) {
+                    tracing::error!("Decode error: {err:#}");
+                }
+            })
+            .expect("failed to spawn decode thread");
 
         let stream = play_audio(consumer, eof_flag_clone, drained_tx)?;
 

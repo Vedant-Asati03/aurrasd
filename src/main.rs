@@ -120,37 +120,43 @@ fn main() -> anyhow::Result<()> {
     ipc::start_ipc_server(cmd_tx.clone(), Arc::clone(&active_clients));
 
     let clients_for_events = Arc::clone(&active_clients);
-    let event_handle = thread::spawn(move || {
-        while let Ok(event) = event_rx.recv() {
-            tracing::info!("Event: {:?}", event);
-            if let Ok(json) = serde_json::to_string(&event) {
-                if let Ok(mut clients) = clients_for_events.lock() {
-                    let mut dead_count = 0;
-                    clients.retain_mut(|client| match writeln!(client, "{}", json) {
-                        Ok(_) => {
-                            let _ = client.flush();
-                            true
+    let event_handle = thread::Builder::new()
+        .name("events".into())
+        .stack_size(1 * 1024 * 1024)
+        .spawn(move || {
+            while let Ok(event) = event_rx.recv() {
+                tracing::info!("Event: {:?}", event);
+                if let Ok(json) = serde_json::to_string(&event) {
+                    if let Ok(mut clients) = clients_for_events.lock() {
+                        let mut dead_count = 0;
+                        clients.retain_mut(|client| match writeln!(client, "{}", json) {
+                            Ok(_) => {
+                                let _ = client.flush();
+                                true
+                            }
+                            Err(_) => {
+                                dead_count += 1;
+                                false
+                            }
+                        });
+                        if dead_count > 0 {
+                            tracing::debug!("Dropped {} dead IPC client(s)", dead_count);
                         }
-                        Err(_) => {
-                            dead_count += 1;
-                            false
-                        }
-                    });
-                    if dead_count > 0 {
-                        tracing::debug!("Dropped {} dead IPC client(s)", dead_count);
+                    } else {
+                        tracing::error!("Failed to lock clients mutex for event broadcasting");
                     }
-                } else {
-                    tracing::error!("Failed to lock clients mutex for event broadcasting");
                 }
             }
-        }
-    });
+        })?;
 
-    let control_handle = thread::spawn(move || {
-        if let Err(e) = control::run_control_loop(cmd_rx, event_tx) {
-            tracing::error!("Control thread error: {e:#}");
-        }
-    });
+    let control_handle = thread::Builder::new()
+        .name("control".into())
+        .stack_size(2 * 1024 * 1024)
+        .spawn(move || {
+            if let Err(e) = control::run_control_loop(cmd_rx, event_tx) {
+                tracing::error!("Control thread error: {e:#}");
+            }
+        })?;
 
     while running.load(Ordering::SeqCst) {
         thread::sleep(Duration::from_millis(100));
