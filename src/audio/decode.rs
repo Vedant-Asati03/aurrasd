@@ -165,6 +165,11 @@ fn symphonia_decode_thread(
     let ch = INTERNAL_FORMAT.channels as usize;
     let target_rate = INTERNAL_FORMAT.sample_rate;
 
+    let mut resample_out: Vec<f32> = Vec::new();
+    let mut accum: Vec<f32> = Vec::new();
+    let mut current_rate: Option<u32> = None;
+    let mut resampler: Option<Fft<f32>> = None;
+
     let push_blocking = |producer: &mut ringbuf::HeapProd<f32>, mut data: &[f32]| -> bool {
         while !data.is_empty() {
             if shutdown_rx.try_recv().is_ok() {
@@ -178,11 +183,6 @@ fn symphonia_decode_thread(
         }
         true
     };
-
-    let mut accumulation = Vec::<f32>::new();
-    let mut current_rate = None;
-    let mut resampler: Option<Fft<f32>> = None;
-    let mut out = Vec::<f32>::new();
 
     loop {
         if shutdown_rx.try_recv().is_ok() {
@@ -210,28 +210,20 @@ fn symphonia_decode_thread(
         let samples = buf.samples();
 
         // Normalize channel count to `ch`
-        let normalized: Vec<f32> = match (input_ch, ch) {
-            (i, o) if i == o => samples.to_vec(),
-            (1, 2) => samples.iter().flat_map(|&s| [s, s]).collect(),
-            (i, o) if i > o => samples
-                .chunks_exact(i)
-                .flat_map(|f| f[..o].iter().copied())
-                .collect(),
-            (i, o) => samples
-                .chunks_exact(i)
-                .flat_map(|f| (0..o).map(move |j| if j < i { f[j] } else { 0.0 }))
-                .collect(),
-        };
-
         if spec.rate == target_rate {
-            if !push_blocking(producer, &normalized) {
-                return Ok(());
-            }
+            push_normalized(
+                producer,
+                samples,
+                input_ch,
+                ch,
+                &mut resample_out,
+                &push_blocking,
+            )?;
             continue;
         }
 
         if current_rate != Some(spec.rate) {
-            accumulation.clear();
+            accum.clear();
             resampler = Some(
                 Fft::<f32>::new(
                     spec.rate as usize,
@@ -246,71 +238,168 @@ fn symphonia_decode_thread(
             current_rate = Some(spec.rate);
         }
 
-        accumulation.extend_from_slice(&normalized);
+        normalize_into(samples, input_ch, ch, &mut accum);
 
         let resampler = resampler.as_mut().unwrap();
-        while accumulation.len() >= resampler.input_frames_next() * ch {
-            let needed = resampler.input_frames_next() * ch;
-            let chunk: Vec<f32> = accumulation.drain(..needed).collect();
-
-            let input_frames = needed / ch;
-            let input_adapter =
-                InterleavedSlice::new(&chunk, ch, input_frames).map_err(|_| DecodeError::Decode)?;
-            let output_frames = resampler.output_frames_max();
-            out.resize(output_frames * ch, 0.0);
-            let mut output_adapter = InterleavedSlice::new_mut(&mut out, ch, output_frames)
-                .map_err(|_| DecodeError::Decode)?;
-            let indexing = Indexing {
-                input_offset: 0,
-                output_offset: 0,
-                active_channels_mask: None,
-                partial_len: None,
-            };
-
-            let written = match resampler.process_into_buffer(
-                &input_adapter,
-                &mut output_adapter,
-                Some(&indexing),
-            ) {
-                Ok((_, w)) => w,
-                Err(e) => {
-                    tracing::error!("Resampler process error: {e}");
-                    continue;
-                }
-            };
-
-            if !push_blocking(producer, &out[..written * ch]) {
-                return Ok(());
-            }
+        if !flush_resampler(
+            resampler,
+            &mut accum,
+            producer,
+            &mut resample_out,
+            ch,
+            false,
+            shutdown_rx,
+        ) {
+            return Ok(());
         }
     }
 
     if let Some(resampler) = resampler.as_mut() {
-        if !accumulation.is_empty() {
-            let needed = resampler.input_frames_next() * ch;
-            accumulation.resize(needed, 0.0);
-
-            let input_adapter = InterleavedSlice::new(&accumulation, ch, needed / ch).unwrap();
-            let output_frames = resampler.output_frames_max();
-            out.resize(output_frames * ch, 0.0);
-            let mut output_adapter =
-                InterleavedSlice::new_mut(&mut out, ch, output_frames).unwrap();
-            let indexing = Indexing {
-                input_offset: 0,
-                output_offset: 0,
-                active_channels_mask: None,
-                partial_len: None,
-            };
-
-            if let Ok((_, written)) =
-                resampler.process_into_buffer(&input_adapter, &mut output_adapter, Some(&indexing))
-            {
-                push_blocking(producer, &out[..written * ch]);
-            }
+        if !accum.is_empty() {
+            flush_resampler(
+                resampler,
+                &mut accum,
+                producer,
+                &mut resample_out,
+                ch,
+                true,
+                shutdown_rx,
+            );
         }
     }
 
     Ok(())
+}
+
+/// Normalize `samples` from `input_ch` to `output_ch` channels and push directly to producer.
+/// Reuses `scratch` to avoid per-call allocation when channel conversion is needed.
+fn push_normalized<F>(
+    producer: &mut ringbuf::HeapProd<f32>,
+    samples: &[f32],
+    input_ch: usize,
+    output_ch: usize,
+    scratch: &mut Vec<f32>,
+    push_blocking: &F,
+) -> DecodeResult<()>
+where
+    F: Fn(&mut ringbuf::HeapProd<f32>, &[f32]) -> bool,
+{
+    if input_ch == output_ch {
+        if !push_blocking(producer, samples) {
+            return Ok(());
+        }
+    } else {
+        scratch.clear();
+        normalize_into(samples, input_ch, output_ch, scratch);
+        if !push_blocking(producer, scratch) {
+            return Ok(());
+        }
+    }
+    Ok(())
+}
+
+/// Normalize interleaved `samples` from `input_ch` to `output_ch` channels, appending into `out`.
+fn normalize_into(samples: &[f32], input_ch: usize, output_ch: usize, out: &mut Vec<f32>) {
+    match (input_ch, output_ch) {
+        (i, o) if i == o => out.extend_from_slice(samples),
+        (1, 2) => {
+            out.reserve(samples.len() * 2);
+            for &s in samples {
+                out.push(s);
+                out.push(s);
+            }
+        }
+        (i, o) if i > o => {
+            out.reserve(samples.len() / i * o);
+            for frame in samples.chunks_exact(i) {
+                out.extend_from_slice(&frame[..o]);
+            }
+        }
+        (i, o) => {
+            out.reserve(samples.len() / i * o);
+            for frame in samples.chunks_exact(i) {
+                for j in 0..o {
+                    out.push(if j < i { frame[j] } else { 0.0 });
+                }
+            }
+        }
+    }
+}
+
+/// Drain `accum` through `resampler` in chunks, pushing output to `producer`.
+/// If `pad` is true, pads accum to the required chunk size before the final flush.
+/// Returns false if shutdown was requested.
+fn flush_resampler(
+    resampler: &mut Fft<f32>,
+    accum: &mut Vec<f32>,
+    producer: &mut ringbuf::HeapProd<f32>,
+    scratch_out: &mut Vec<f32>,
+    ch: usize,
+    pad: bool,
+    shutdown_rx: &Receiver<()>,
+) -> bool {
+    loop {
+        let needed = resampler.input_frames_next() * ch;
+
+        if accum.len() < needed {
+            if pad && !accum.is_empty() {
+                accum.resize(needed, 0.0);
+            } else {
+                break;
+            }
+        }
+
+        let input_frames = needed / ch;
+        let output_frames = resampler.output_frames_max();
+        scratch_out.resize(output_frames * ch, 0.0);
+
+        let input_adapter = InterleavedSlice::new(&accum[..needed], ch, input_frames)
+            .map_err(|_| ())
+            .unwrap();
+        let mut output_adapter = InterleavedSlice::new_mut(scratch_out, ch, output_frames)
+            .map_err(|_| ())
+            .unwrap();
+
+        let indexing = Indexing {
+            input_offset: 0,
+            output_offset: 0,
+            active_channels_mask: None,
+            partial_len: None,
+        };
+
+        let written = match resampler.process_into_buffer(
+            &input_adapter,
+            &mut output_adapter,
+            Some(&indexing),
+        ) {
+            Ok((_, w)) => w,
+            Err(e) => {
+                tracing::error!("Resampler process error: {e}");
+                accum.drain(..needed);
+                continue;
+            }
+        };
+
+        accum.drain(..needed);
+
+        let mut remaining = &scratch_out[..written * ch];
+        while !remaining.is_empty() {
+            if shutdown_rx.try_recv().is_ok() {
+                return false;
+            }
+            let pushed = producer.push_slice(remaining);
+            remaining = &remaining[pushed..];
+            if !remaining.is_empty() {
+                thread::sleep(Duration::from_micros(100));
+            }
+        }
+
+        if pad {
+            break; // single flush for the tail
+        }
+    }
+
+    true
 }
 
 fn ffmpeg_decode_thread(
@@ -338,7 +427,7 @@ fn ffmpeg_decode_thread(
         .map_err(|_| DecodeError::Decoder)?;
 
     let mut stdout = child.stdout.take().unwrap();
-    let mut buf = vec![0u8; 4096 * 4]; // We use a Vec and not a stack array because rust does not guarantee byte internal alignment which is required by bytemuck
+    let mut buf = vec![0u8; 4096 * 4];
 
     loop {
         if shutdown_rx.try_recv().is_ok() {
