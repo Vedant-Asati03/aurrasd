@@ -5,7 +5,6 @@ use aurrasd::{
 
 use std::{
     io::Write,
-    net::TcpStream,
     sync::{
         Arc, Mutex,
         atomic::{AtomicBool, Ordering},
@@ -15,6 +14,7 @@ use std::{
 };
 
 use crossbeam_channel::bounded;
+use interprocess::local_socket::{GenericFilePath, GenericNamespaced, Stream, prelude::*};
 
 fn show_help() {
     println!("aurrasd [OPTIONS] <COMMAND> [ARGS]");
@@ -46,33 +46,24 @@ fn handle_args(args: Vec<String>) -> anyhow::Result<bool> {
                 show_help();
                 return Ok(true);
             }
-
             "play" => {
                 if args.len() < 3 {
                     anyhow::bail!("Usage: aurrasd play <path>");
                 }
                 Command::Play(args[2].clone())
             }
-
             "pause" => Command::Pause,
-
             "resume" => Command::Resume,
-
             "stop" => Command::Stop,
-
             "next" => Command::Next,
-
             "prev" | "previous" => Command::Previous,
-
             "clear" => Command::ClearQueue,
-
             "enqueue" => {
                 if args.len() < 3 {
                     anyhow::bail!("Usage: aurrasd enqueue <path>");
                 }
                 Command::Enqueue(args[2].clone())
             }
-
             "volume" => {
                 if args.len() < 3 {
                     anyhow::bail!("Usage: aurrasd volume <0.0-1.0>");
@@ -83,13 +74,24 @@ fn handle_args(args: Vec<String>) -> anyhow::Result<bool> {
             _ => anyhow::bail!("Unknown command: {}", args[1]),
         };
 
-        match TcpStream::connect("127.0.0.1:28772") {
+        let name = if GenericNamespaced::is_supported() {
+            "aurrasd.sock".to_ns_name::<GenericNamespaced>().unwrap()
+        } else {
+            std::env::temp_dir()
+                .join("aurrasd.sock")
+                .to_string_lossy()
+                .into_owned()
+                .to_fs_name::<GenericFilePath>()
+                .unwrap()
+        };
+
+        match Stream::connect(name.clone()) {
             Ok(mut stream) => {
                 let json = serde_json::to_string(&cmd)?;
                 writeln!(stream, "{}", json)?;
             }
             Err(_) => {
-                eprintln!("Daemon is not running. Could not connect to 127.0.0.1:28772");
+                eprintln!("Daemon is not running. Could not connect to socket.");
                 std::process::exit(1);
             }
         }
@@ -120,7 +122,7 @@ fn main() -> anyhow::Result<()> {
         r.store(false, Ordering::SeqCst);
     })?;
 
-    let active_clients = Arc::new(Mutex::new(Vec::<TcpStream>::new()));
+    let active_clients = Arc::new(Mutex::new(Vec::<Stream>::new()));
     ipc::start_ipc_server(cmd_tx.clone(), Arc::clone(&active_clients));
 
     let clients_for_events = Arc::clone(&active_clients);
@@ -146,8 +148,6 @@ fn main() -> anyhow::Result<()> {
                         if dead_count > 0 {
                             tracing::debug!("Dropped {} dead IPC client(s)", dead_count);
                         }
-                    } else {
-                        tracing::error!("Failed to lock clients mutex for event broadcasting");
                     }
                 }
             }
