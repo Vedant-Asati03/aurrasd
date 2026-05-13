@@ -21,7 +21,7 @@ fn play_track(
         Ok(session) => {
             playback_state.status = PlaybackStatus::Playing;
             let _ = event_tx.send(Event::PlaybackStarted(path));
-            let _ = event_tx.send(Event::StateChanged(playback_state.clone()));
+            let _ = event_tx.send(Event::StateChanged(playback_state.status));
             *current_session = Some(session);
         }
         Err(err) => {
@@ -63,7 +63,7 @@ pub fn run_control_loop(cmd_rx: Receiver<Command>, event_tx: Sender<Event>) -> R
                         PlaybackSession::stop(session);
                         playback_state.status = PlaybackStatus::Stopped;
                         let _ = event_tx.send(Event::PlaybackStopped);
-                        let _ = event_tx.send(Event::StateChanged(playback_state.clone()));
+                        let _ = event_tx.send(Event::StateChanged(playback_state.status));
                     }
                 }
 
@@ -76,7 +76,7 @@ pub fn run_control_loop(cmd_rx: Receiver<Command>, event_tx: Sender<Event>) -> R
                         } else {
                             playback_state.status = PlaybackStatus::Paused;
                             let _ = event_tx.send(Event::PlaybackPaused);
-                            let _ = event_tx.send(Event::StateChanged(playback_state.clone()));
+                            let _ = event_tx.send(Event::StateChanged(playback_state.status));
                         }
                     }
                 }
@@ -90,7 +90,7 @@ pub fn run_control_loop(cmd_rx: Receiver<Command>, event_tx: Sender<Event>) -> R
                         } else {
                             playback_state.status = PlaybackStatus::Playing;
                             let _ = event_tx.send(Event::PlaybackResumed);
-                            let _ = event_tx.send(Event::StateChanged(playback_state.clone()));
+                            let _ = event_tx.send(Event::StateChanged(playback_state.status));
                         }
                     }
                 }
@@ -100,7 +100,6 @@ pub fn run_control_loop(cmd_rx: Receiver<Command>, event_tx: Sender<Event>) -> R
                 Command::Enqueue(path) => {
                     playback_state.queue.push_back(path);
                     let _ = event_tx.send(Event::QueueUpdated);
-                    let _ = event_tx.send(Event::StateChanged(playback_state.clone()));
                 }
 
                 Command::Next => {
@@ -112,7 +111,7 @@ pub fn run_control_loop(cmd_rx: Receiver<Command>, event_tx: Sender<Event>) -> R
                             PlaybackSession::stop(session);
                             playback_state.status = PlaybackStatus::Stopped;
                             let _ = event_tx.send(Event::PlaybackStopped);
-                            let _ = event_tx.send(Event::StateChanged(playback_state.clone()));
+                            let _ = event_tx.send(Event::StateChanged(playback_state.status));
                         }
                     }
                 }
@@ -122,7 +121,6 @@ pub fn run_control_loop(cmd_rx: Receiver<Command>, event_tx: Sender<Event>) -> R
                 Command::ClearQueue => {
                     playback_state.queue.clear();
                     let _ = event_tx.send(Event::QueueUpdated);
-                    let _ = event_tx.send(Event::StateChanged(playback_state.clone()));
                 }
             }
         } else if let Some(idx) = drained_idx {
@@ -139,7 +137,7 @@ pub fn run_control_loop(cmd_rx: Receiver<Command>, event_tx: Sender<Event>) -> R
                     let _ = event_tx.send(Event::QueueUpdated);
                     play_track(path, &mut current_session, &mut playback_state, &event_tx);
                 } else {
-                    let _ = event_tx.send(Event::StateChanged(playback_state.clone()));
+                    let _ = event_tx.send(Event::StateChanged(playback_state.status));
                 }
             }
         }

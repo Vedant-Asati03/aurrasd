@@ -23,7 +23,7 @@ pub enum Event {
     PlaybackFinished,
     Error(String),
     QueueUpdated,
-    StateChanged(PlaybackState),
+    StateChanged(PlaybackStatus),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
