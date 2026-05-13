@@ -6,6 +6,7 @@ use crate::{
     command::Command,
     event::Event,
     session::PlaybackSession,
+    state::{PlaybackState, PlaybackStatus},
 };
 
 use std::thread;
@@ -16,6 +17,45 @@ use crossbeam_channel::{Receiver, Select, Sender, bounded};
 
 pub fn run_control_loop(cmd_rx: Receiver<Command>, event_tx: Sender<Event>) -> Result<()> {
     let mut current_session: Option<PlaybackSession> = None;
+    let mut playback_state = PlaybackState::new();
+
+    macro_rules! play_track_macro {
+        ($path:expr) => {
+            if let Some(session) = current_session.take() {
+                PlaybackSession::stop(session);
+            }
+
+            let (producer, consumer) = create_audio_buffer();
+            let (shutdown_tx, shutdown_rx) = bounded::<()>(1);
+            let (finished_tx, finished_rx) = bounded::<()>(1);
+
+            let path_clone = $path.clone();
+
+            let decode_thread = thread::spawn(move || {
+                if let Err(err) = decode_thread(&path_clone, producer, shutdown_rx, finished_tx) {
+                    tracing::error!("Decode error: {err:#}");
+                }
+            });
+
+            match play_audio(consumer) {
+                Ok(stream) => {
+                    playback_state.status = PlaybackStatus::Playing;
+                    let _ = event_tx.send(Event::PlaybackStarted($path));
+                    let _ = event_tx.send(Event::StateChanged(playback_state.clone()));
+                    current_session = Some(PlaybackSession::new(
+                        stream,
+                        decode_thread,
+                        shutdown_tx,
+                        finished_rx,
+                    ));
+                }
+                Err(err) => {
+                    tracing::error!("Playback error: {err:#}");
+                    let _ = event_tx.send(Event::Error(format!("Playback error: {}", err)));
+                }
+            }
+        };
+    }
 
     loop {
         let mut sel = Select::new();
@@ -37,48 +77,15 @@ pub fn run_control_loop(cmd_rx: Receiver<Command>, event_tx: Sender<Event>) -> R
 
             match command {
                 Command::Play(path) => {
-                    if let Some(session) = current_session.take() {
-                        PlaybackSession::stop(session);
-                    }
-
-                    let (producer, consumer) = create_audio_buffer();
-                    let (shutdown_tx, shutdown_rx) = bounded::<()>(1);
-                    let (finished_tx, finished_rx) = bounded::<()>(1);
-
-                    let path_clone = path.clone();
-
-                    let decode_thread = thread::spawn(move || {
-                        if let Err(err) =
-                            decode_thread(&path_clone, producer, shutdown_rx, finished_tx)
-                        {
-                            tracing::error!("Decode error: {err:#}");
-                        }
-                    });
-
-                    let stream = match play_audio(consumer) {
-                        Ok(stream) => {
-                            let _ = event_tx.send(Event::PlaybackStarted(path));
-                            stream
-                        }
-                        Err(err) => {
-                            tracing::error!("Playback error: {err:#}");
-                            let _ = event_tx.send(Event::Error(format!("Playback error: {}", err)));
-                            continue;
-                        }
-                    };
-
-                    current_session = Some(PlaybackSession::new(
-                        stream,
-                        decode_thread,
-                        shutdown_tx,
-                        finished_rx,
-                    ));
+                    play_track_macro!(path);
                 }
 
                 Command::Stop => {
                     if let Some(session) = current_session.take() {
                         PlaybackSession::stop(session);
+                        playback_state.status = PlaybackStatus::Stopped;
                         let _ = event_tx.send(Event::PlaybackStopped);
+                        let _ = event_tx.send(Event::StateChanged(playback_state.clone()));
                     }
                 }
 
@@ -89,7 +96,9 @@ pub fn run_control_loop(cmd_rx: Receiver<Command>, event_tx: Sender<Event>) -> R
                             let _ = event_tx
                                 .send(Event::Error(format!("Failed to pause stream: {}", err)));
                         } else {
+                            playback_state.status = PlaybackStatus::Paused;
                             let _ = event_tx.send(Event::PlaybackPaused);
+                            let _ = event_tx.send(Event::StateChanged(playback_state.clone()));
                         }
                     }
                 }
@@ -101,21 +110,61 @@ pub fn run_control_loop(cmd_rx: Receiver<Command>, event_tx: Sender<Event>) -> R
                             let _ = event_tx
                                 .send(Event::Error(format!("Failed to resume stream: {}", err)));
                         } else {
+                            playback_state.status = PlaybackStatus::Playing;
                             let _ = event_tx.send(Event::PlaybackResumed);
+                            let _ = event_tx.send(Event::StateChanged(playback_state.clone()));
                         }
                     }
                 }
 
                 Command::SetVolume(_) => {}
+
+                Command::Enqueue(path) => {
+                    playback_state.queue.push_back(path);
+                    let _ = event_tx.send(Event::QueueUpdated);
+                    let _ = event_tx.send(Event::StateChanged(playback_state.clone()));
+                }
+
+                Command::Next => {
+                    if let Some(path) = playback_state.queue.pop_front() {
+                        let _ = event_tx.send(Event::QueueUpdated);
+                        play_track_macro!(path);
+                    } else {
+                        if let Some(session) = current_session.take() {
+                            PlaybackSession::stop(session);
+                            playback_state.status = PlaybackStatus::Stopped;
+                            let _ = event_tx.send(Event::PlaybackStopped);
+                            let _ = event_tx.send(Event::StateChanged(playback_state.clone()));
+                        }
+                    }
+                }
+
+                Command::Previous => {
+                    // Previous not fully implemented yet but skeleton added
+                }
+
+                Command::ClearQueue => {
+                    playback_state.queue.clear();
+                    let _ = event_tx.send(Event::QueueUpdated);
+                    let _ = event_tx.send(Event::StateChanged(playback_state.clone()));
+                }
             }
         } else if let Some(idx) = finished_idx {
             if oper.index() == idx {
                 let _ = oper.recv(&current_session.as_ref().unwrap().finished_rx);
 
                 if let Some(session) = current_session.take() {
-                    PlaybackSession::stop(session); // We still wait for things to cleanly shut down
+                    playback_state.status = PlaybackStatus::Stopped;
+                    PlaybackSession::stop(session);
                 }
                 let _ = event_tx.send(Event::PlaybackFinished);
+
+                if let Some(path) = playback_state.queue.pop_front() {
+                    let _ = event_tx.send(Event::QueueUpdated);
+                    play_track_macro!(path);
+                } else {
+                    let _ = event_tx.send(Event::StateChanged(playback_state.clone()));
+                }
             }
         }
     }

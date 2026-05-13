@@ -1,3 +1,5 @@
+use crate::state;
+
 use serde::{Deserialize, Serialize};
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
@@ -8,4 +10,6 @@ pub enum Event {
     PlaybackResumed,
     PlaybackFinished,
     Error(String),
+    QueueUpdated,
+    StateChanged(state::PlaybackState),
 }

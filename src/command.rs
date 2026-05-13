@@ -5,4 +5,8 @@ pub enum Command {
     Pause,
     Resume,
     SetVolume(f32),
+    Enqueue(String),
+    Next,
+    Previous,
+    ClearQueue,
 }
