@@ -1,8 +1,12 @@
 use crate::audio::{
-    AudioFormat, INTERNAL_BUFFER_SECONDS, INTERNAL_FORMAT, output_adapter::OutputAdapter,
+    AudioFormat, INTERNAL_BUFFER_SECONDS, INTERNAL_FORMAT, PREBUFFER_MS,
+    output_adapter::OutputAdapter,
 };
 
-use std::sync::{Arc, atomic};
+use std::sync::{
+    Arc,
+    atomic::{AtomicBool, Ordering},
+};
 
 use anyhow::{Context, Result, anyhow};
 use cpal::{
@@ -60,8 +64,6 @@ pub fn select_output_format(device: &Device) -> Result<AudioFormat> {
     Err(anyhow!("No compatible output format"))
 }
 
-/// Create the ring buffer sized to the *device* sample rate so that the
-/// INTERNAL_BUFFER_SECONDS constant is meaningful even after resampling.
 pub fn create_audio_buffer(
     device_format: &AudioFormat,
 ) -> (ringbuf::HeapProd<f32>, ringbuf::HeapCons<f32>) {
@@ -78,10 +80,9 @@ pub fn create_audio_buffer(
 
 pub fn play_audio(
     mut consumer: ringbuf::HeapCons<f32>,
-    eof_flag: Arc<atomic::AtomicBool>,
+    eof_flag: Arc<AtomicBool>,
     drained_tx: crossbeam_channel::Sender<()>,
     stream_error_tx: crossbeam_channel::Sender<String>,
-    prebuffer_rx: crossbeam_channel::Receiver<()>,
 ) -> Result<cpal::Stream> {
     let device = get_output_device()?;
     let device_format = select_output_format(&device)?;
@@ -92,8 +93,6 @@ pub fn play_audio(
         buffer_size: cpal::BufferSize::Default,
     };
 
-    drop(prebuffer_rx);
-
     let mut adapter = OutputAdapter::new(device_format.clone());
 
     let stream_error_tx_clone = stream_error_tx.clone();
@@ -103,17 +102,31 @@ pub fn play_audio(
         let _ = stream_error_tx_clone.try_send(msg);
     };
 
+    let prebuffer_samples =
+        (INTERNAL_FORMAT.sample_rate as usize * INTERNAL_FORMAT.channels as usize * PREBUFFER_MS)
+            / 1000;
+
+    let mut is_buffering = true;
+
     let stream = match device_format.sample_format {
         SampleFormat::F32 => {
             let mut sent_drained = false;
             device.build_output_stream(
                 &config,
                 move |output: &mut [f32], _| {
+                    if is_buffering {
+                        if consumer.occupied_len() >= prebuffer_samples
+                            || eof_flag.load(Ordering::Acquire)
+                        {
+                            is_buffering = false;
+                        } else {
+                            output.fill(0.0);
+                            return;
+                        }
+                    }
+
                     adapter.fill_buffer(&mut consumer, output);
-                    if !sent_drained
-                        && consumer.is_empty()
-                        && eof_flag.load(atomic::Ordering::Acquire)
-                    {
+                    if !sent_drained && consumer.is_empty() && eof_flag.load(Ordering::Acquire) {
                         let _ = drained_tx.try_send(());
                         sent_drained = true;
                     }
@@ -128,15 +141,23 @@ pub fn play_audio(
             device.build_output_stream(
                 &config,
                 move |output: &mut [i16], _| {
+                    if is_buffering {
+                        if consumer.occupied_len() >= prebuffer_samples
+                            || eof_flag.load(Ordering::Acquire)
+                        {
+                            is_buffering = false;
+                        } else {
+                            output.fill(cpal::Sample::from_sample(0.0_f32));
+                            return;
+                        }
+                    }
+
                     temp_buffer.resize(output.len(), 0.0_f32);
                     adapter.fill_buffer(&mut consumer, &mut temp_buffer);
                     for (i, &f) in temp_buffer.iter().enumerate() {
                         output[i] = cpal::Sample::from_sample(f);
                     }
-                    if !sent_drained
-                        && consumer.is_empty()
-                        && eof_flag.load(atomic::Ordering::Acquire)
-                    {
+                    if !sent_drained && consumer.is_empty() && eof_flag.load(Ordering::Acquire) {
                         let _ = drained_tx.try_send(());
                         sent_drained = true;
                     }
@@ -151,15 +172,24 @@ pub fn play_audio(
             device.build_output_stream(
                 &config,
                 move |output: &mut [u16], _| {
+                    if is_buffering {
+                        if consumer.occupied_len() >= prebuffer_samples
+                            || eof_flag.load(Ordering::Acquire)
+                        {
+                            is_buffering = false;
+                        } else {
+                            // Automatically maps to 32768 for U16 to prevent speaker popping
+                            output.fill(cpal::Sample::from_sample(0.0_f32));
+                            return;
+                        }
+                    }
+
                     temp_buffer.resize(output.len(), 0.0_f32);
                     adapter.fill_buffer(&mut consumer, &mut temp_buffer);
                     for (i, &f) in temp_buffer.iter().enumerate() {
                         output[i] = cpal::Sample::from_sample(f);
                     }
-                    if !sent_drained
-                        && consumer.is_empty()
-                        && eof_flag.load(atomic::Ordering::Acquire)
-                    {
+                    if !sent_drained && consumer.is_empty() && eof_flag.load(Ordering::Acquire) {
                         let _ = drained_tx.try_send(());
                         sent_drained = true;
                     }
