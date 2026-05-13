@@ -13,7 +13,7 @@ use interprocess::{
 };
 
 struct Client {
-    stream: Stream,
+    _stream: Stream,
     #[allow(dead_code)]
     thread: thread::JoinHandle<()>,
 }
@@ -92,7 +92,7 @@ pub fn start_ipc_server(cmd_tx: Sender<Command>, clients: Arc<Mutex<Vec<Stream>>
                             .expect("failed to spawn IPC client thread");
 
                         client_threads.push(Client {
-                            stream,
+                            _stream: stream,
                             thread: handle,
                         });
                     }

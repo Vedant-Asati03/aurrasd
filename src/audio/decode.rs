@@ -1,15 +1,9 @@
 use crate::audio::{ACCUM_MAX_SAMPLES, FFT_CHUNK_SIZE, INTERNAL_FORMAT};
 
-use std::{
-    fs::File,
-    path::Path,
-    sync::{Arc, atomic},
-    thread,
-    time::Duration,
-};
+use std::{fs::File, path::Path, thread, time::Duration};
 
 use audioadapter_buffers::direct::InterleavedSlice;
-use crossbeam_channel::Receiver;
+use crossbeam_channel::{Receiver, Sender};
 use reqwest::header::CONTENT_TYPE;
 use ringbuf::traits::Producer;
 use rubato::{Fft, FixedSync, Indexing, Resampler};
@@ -115,31 +109,30 @@ fn open_media(path: &str) -> DecodeResult<(Box<dyn MediaSource>, Hint)> {
 }
 
 pub fn decode_thread(
-    path: &str,
+    path: String,
     mut producer: ringbuf::HeapProd<f32>,
     shutdown_rx: Receiver<()>,
-    eof_flag: Arc<atomic::AtomicBool>,
-) -> DecodeResult<()> {
-    let res = match symphonia_decode_thread(path, &mut producer, &shutdown_rx) {
+    error_tx: Sender<String>,
+    return_tx: Sender<ringbuf::HeapProd<f32>>,
+) {
+    let res = match symphonia_decode_thread(&path, &mut producer, &shutdown_rx) {
         Ok(()) => Ok(()),
         Err(DecodeError::Probe) | Err(DecodeError::NoTrack) | Err(DecodeError::Decoder) => {
             tracing::warn!("Symphonia failed, falling back to FFmpeg...");
-            match ffmpeg_decode_thread(path, &mut producer, &shutdown_rx) {
+            match ffmpeg_decode_thread(&path, &mut producer, &shutdown_rx) {
                 Ok(()) => Ok(()),
-                Err(e) => {
-                    tracing::error!("FFmpeg fallback failed: {e}");
-                    Err(e)
-                }
+                Err(e) => Err(e),
             }
         }
-        Err(e) => {
-            tracing::error!("Decode error: {e}");
-            Err(e)
-        }
+        Err(e) => Err(e),
     };
 
-    eof_flag.store(true, atomic::Ordering::Release);
-    res
+    if let Err(e) = res {
+        tracing::error!("Decode error: {e}");
+        let _ = error_tx.try_send(format!("Decode failed: {}", e));
+    }
+
+    let _ = return_tx.send(producer);
 }
 
 fn symphonia_decode_thread(
@@ -176,9 +169,11 @@ fn symphonia_decode_thread(
 
     let push_blocking = |producer: &mut ringbuf::HeapProd<f32>, mut data: &[f32]| -> bool {
         while !data.is_empty() {
-            if shutdown_rx.try_recv().is_ok() {
-                return false;
+            match shutdown_rx.try_recv() {
+                Ok(_) | Err(crossbeam_channel::TryRecvError::Disconnected) => return false,
+                Err(crossbeam_channel::TryRecvError::Empty) => {}
             }
+
             let pushed = producer.push_slice(data);
             data = &data[pushed..];
             if !data.is_empty() {
@@ -189,14 +184,24 @@ fn symphonia_decode_thread(
     };
 
     loop {
-        if shutdown_rx.try_recv().is_ok() {
-            break;
+        match shutdown_rx.try_recv() {
+            Ok(_) | Err(crossbeam_channel::TryRecvError::Disconnected) => break,
+            Err(crossbeam_channel::TryRecvError::Empty) => {}
         }
 
         let packet = match format.next_packet() {
             Ok(p) => p,
-            Err(_) => break,
+            Err(symphonia::core::errors::Error::IoError(err))
+                if err.kind() == std::io::ErrorKind::UnexpectedEof =>
+            {
+                break;
+            }
+            Err(e) => {
+                tracing::error!("Stream read error: {}", e);
+                return Err(DecodeError::Decode);
+            }
         };
+
         if packet.track_id() != track_id {
             continue;
         }
@@ -414,8 +419,9 @@ fn flush_resampler(
 
         let mut remaining = &scratch_out[..written * ch];
         while !remaining.is_empty() {
-            if shutdown_rx.try_recv().is_ok() {
-                return false;
+            match shutdown_rx.try_recv() {
+                Ok(_) | Err(crossbeam_channel::TryRecvError::Disconnected) => return false,
+                Err(crossbeam_channel::TryRecvError::Empty) => {}
             }
             let pushed = producer.push_slice(remaining);
             remaining = &remaining[pushed..];
@@ -468,10 +474,13 @@ fn ffmpeg_decode_thread(
     let mut buf = vec![0u8; 4096 * 4];
 
     loop {
-        if shutdown_rx.try_recv().is_ok() {
-            let _ = child.kill();
-            let _ = child.wait();
-            return Ok(());
+        match shutdown_rx.try_recv() {
+            Ok(_) | Err(crossbeam_channel::TryRecvError::Disconnected) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Ok(());
+            }
+            Err(crossbeam_channel::TryRecvError::Empty) => {}
         }
 
         match std::io::Read::read(&mut stdout, &mut buf) {
@@ -485,10 +494,13 @@ fn ffmpeg_decode_thread(
 
                 let mut remaining_floats = floats;
                 while !remaining_floats.is_empty() {
-                    if shutdown_rx.try_recv().is_ok() {
-                        let _ = child.kill();
-                        let _ = child.wait();
-                        return Ok(());
+                    match shutdown_rx.try_recv() {
+                        Ok(_) | Err(crossbeam_channel::TryRecvError::Disconnected) => {
+                            let _ = child.kill();
+                            let _ = child.wait();
+                            return Ok(());
+                        }
+                        Err(crossbeam_channel::TryRecvError::Empty) => {}
                     }
                     let pushed = producer.push_slice(remaining_floats);
                     remaining_floats = &remaining_floats[pushed..];
